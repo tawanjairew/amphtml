@@ -58,10 +58,19 @@ You can listen to multiple events on an element by separating the two events wit
 
 Example: `on="submit-success:lightbox1;submit-error:lightbox2"`
 
+
+## Multiple Actions For One Event
+You can execute multiple actions in sequence for the same event by separating the two actions with a comma ','.
+
+Example: `on="tap:target1.actionA,target2.actionB"`
+
+
 ## Globally defined Events and Actions
 Currently AMP defines `tap` event globally that you can listen to on any HTML element (including amp-elements).
 
-AMP also defines a `hide` action globally that you can trigger on any HTML element.
+AMP also defines `hide`, `show` and `toggleVisibility` actions globally that you can trigger on any HTML element.
+
+{% call callout('Note', type='note') %}Note: {% endcall %} An element can only be shown if it was previously hidden by a `hide` or `toggleVisibility` action, or by using the [`hidden`](https://developer.mozilla.org/en-US/docs/Web/HTML/Global_attributes/hidden) attribute. `show` does not support elements hidden by CSS `display:none` or AMP's `layout=nodisplay`
 
 For example, the following is possible in AMP.
 
@@ -72,7 +81,23 @@ For example, the following is possible in AMP.
 ```
 
 ## Element Specific Events
-### amp-carousel
+### * - all elements
+<table>
+  <tr>
+    <th>Event</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>tap</td>
+    <td>Fired when the element is clicked/tapped.</td>
+  </tr>
+</table>
+
+
+### Input Elements (any that fires `change` and `input` event)
+
+Including: `input[type=radio]`, `input[type=checkbox]`, `input[type=range]`, and `select`.
+
 <table>
   <tr>
     <th>Event</th>
@@ -80,9 +105,71 @@ For example, the following is possible in AMP.
     <th>Data</th>
   </tr>
   <tr>
-    <td>goToSlide</td>
-    <td>Fired when the user changes the carousel's current slide.</td>
-    <td><code>index</code> : slide number</td>
+    <td>change</td>
+    <td>Fired when the value of the element is changed and committed.</td>
+    <td>Various, see below.</td>
+  </tr>
+  <tr>
+    <td>input-debounced</td>
+    <td>Fired when the value of the element is changed. This is similar to the standard input event, but it only fires when 300ms have passed after the value of the input has stopped changing. This is currently experimental, so [the "input-debounced" experiment must be enabled](https://www.ampproject.org/docs/reference/experimental) before using.</td>
+    <td>Various, see below.</td>
+  </tr>
+</table>
+
+#### `change` event data
+<table>
+  <tr>
+    <th>Input Type</th>
+    <th>Data</th>
+  </tr>
+  <tr>
+    <td>Range</td>
+    <td>
+      <code>event.min</code> : The minimum value of the range<br>
+      <code>event.value</code> : The current value of the range<br>
+      <code>event.max</code> : The maximum value of the range<br>
+    </td>
+  </tr>
+  <tr>
+    <td>Radio</td>
+    <td><code>event.checked</code> : If the element is checked</td>
+  </tr>
+  <tr>
+    <td>Checkbox</td>
+    <td><code>event.checked</code> : If the element is checked</td>
+  </tr>
+  <tr>
+    <td>Text</td>
+    <td><code>event.value</code> : The text currently in the text box
+  </tr>
+</table>
+
+
+### amp-carousel[type="slides"]
+<table>
+  <tr>
+    <th>Event</th>
+    <th>Description</th>
+    <th>Data</th>
+  </tr>
+  <tr>
+    <td>slideChange</td>
+    <td>Fired when the user manually changes the carousel's current slide. Does not fire on autoplay or the <code>goToSlide</code> action.</td>
+    <td><code>event.index</code> : slide number</td>
+  </tr>
+</table>
+
+### amp-selector
+<table>
+  <tr>
+    <th>Event</th>
+    <th>Description</th>
+    <th>Data</th>
+  </tr>
+  <tr>
+    <td>select</td>
+    <td>Fired when the user manually selects an option.</td>
+    <td><code>event.targetOption</code> : The <code>option</code> attribute value of the selected element</td>
   </tr>
 </table>
 
@@ -101,12 +188,12 @@ For example, the following is possible in AMP.
   <tr>
     <td>submit-success</td>
     <td>Fired when the form submission response is success.</td>
-    <td><code>response</code> : JSON response</td>
+    <td><code>event.response</code> : JSON response</td>
   </tr>
   <tr>
     <td>submit-error</td>
     <td>Fired when the form submission response is an error.</td>
-    <td><code>response</code> : JSON response</td>
+    <td><code>event.response</code> : JSON response</td>
   </tr>
 </table>
 
@@ -121,6 +208,26 @@ For example, the following is possible in AMP.
   <tr>
     <td>hide</td>
     <td>Hides the target element.</td>
+  </tr>
+  <tr>
+    <td>show</td>
+    <td>Shows the target element.</td>
+  </tr>
+  <tr>
+    <td>toggleVisibility</td>
+    <td>Toggles the visibility of the target element.</td>
+  </tr>
+</table>
+
+### amp-carousel[type="slides"]
+<table>
+  <tr>
+    <th>Action</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>goToSlide(index=INTEGER)</td>
+    <td>Advances the carousel to a specified slide index.</td>
   </tr>
 </table>
 
@@ -205,18 +312,8 @@ For example, the following is possible in AMP.
     <th>Description</th>
   </tr>
   <tr>
-    <td width="30%">amp-state</td>
-    <td>(default)</td>
-    <td>Updates the amp-state's data with the data contained in the event. Requires <a href="../extensions/amp-bind/amp-bind.md">amp-bind</a>.</td>
-  </tr>
-  <tr>
     <td>dismiss (default)</td>
     <td>Hides the referenced user notification element.</td>
-  </tr>
-  <tr>
-    <td width="30%">amp-carousel[type="slides"]</td>
-    <td>goToSlide</td>
-    <td>Advances the carousel to a specified slide index</td>
   </tr>
 </table>
 
@@ -244,6 +341,18 @@ For example, the following is possible in AMP.
   </tr>
 </table>
 
+### form
+<table>
+  <tr>
+    <th>Action</th>
+    <th>Description</th>
+  </tr>
+  <tr>
+    <td>submit</td>
+    <td>Submits the form.</td>
+  </tr>
+</table>
+
 ## `AMP` target
 
 `AMP` target is a special target. It's provided by the AMP runtime and implements top-level
@@ -260,6 +369,6 @@ actions that apply to the whole document.
   </tr>
   <tr>
     <td>setState</td>
-    <td>Updates local bindable state. Requires <a href="../extensions/amp-bind/amp-bind.md">amp-bind</a>.</td>
+    <td>Updates <code>amp-bind</code>'s state. See <a href="../extensions/amp-bind/amp-bind.md#ampsetstate">details</a>.</td>
   </tr>
 </table>

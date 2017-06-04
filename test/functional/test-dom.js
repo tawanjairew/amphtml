@@ -15,18 +15,18 @@
  */
 
 import * as dom from '../../src/dom';
-import * as sinon from 'sinon';
 import {loadPromise} from '../../src/event-helper';
 import {toArray} from '../../src/types';
+import {BaseElement} from '../../src/base-element';
+import {createAmpElementProto} from '../../src/custom-element';
 
 
-
-describe('DOM', () => {
+describes.sandboxed('DOM', {}, env => {
 
   let sandbox;
 
   beforeEach(() => {
-    sandbox = sinon.sandbox.create();
+    sandbox = env.sandbox;
   });
 
   afterEach(() => {
@@ -66,6 +66,40 @@ describe('DOM', () => {
     expect(other.textContent).to.equal('ABC');
   });
 
+  it('isConnectedNode', () => {
+    expect(dom.isConnectedNode(document)).to.be.true;
+
+    const a = document.createElement('div');
+    expect(dom.isConnectedNode(a)).to.be.false;
+
+    const b = document.createElement('div');
+    b.appendChild(a);
+
+    document.body.appendChild(b);
+    expect(dom.isConnectedNode(a)).to.be.true;
+
+    const shadow = a.attachShadow({mode: 'open'});
+    const c = document.createElement('div');
+    shadow.appendChild(c);
+    expect(dom.isConnectedNode(c)).to.be.true;
+
+    document.body.removeChild(b);
+    expect(dom.isConnectedNode(c)).to.be.false;
+  });
+
+  it('rootNodeFor', () => {
+    const a = document.createElement('div');
+    expect(dom.rootNodeFor(a)).to.equal(a);
+
+    const b = document.createElement('div');
+    a.appendChild(b);
+    expect(dom.rootNodeFor(b)).to.equal(a);
+
+    const c = document.createElement('div');
+    b.appendChild(c);
+    expect(dom.rootNodeFor(c)).to.equal(a);
+  });
+
   it('closest should find itself', () => {
     const element = document.createElement('div');
 
@@ -94,7 +128,7 @@ describe('DOM', () => {
     expect(cbSpy).to.be.calledThrice;
 
     expect(dom.closest(grandchild, cb, child)).to.be.null;
-    expect(cbSpy.callCount).to.equal(4);
+    expect(cbSpy).to.have.callCount(4);
 
   });
 
@@ -399,6 +433,27 @@ describe('DOM', () => {
         .to.be.equal(0);
   });
 
+  it('iterateCursor should loop through every element in a NodeList', () => {
+    const fragment = document.createDocumentFragment();
+    [0, 1, 2].forEach(() => fragment.appendChild(document.createElement('i')));
+
+    const iSpy = sandbox.spy();
+    dom.iterateCursor(fragment.querySelectorAll('i'), iSpy);
+    expect(iSpy).to.be.calledThrice;
+
+    const bSpy = sandbox.spy();
+    dom.iterateCursor(fragment.querySelectorAll('b'), bSpy);
+    expect(bSpy).to.be.notCalled;
+  });
+
+  it('iterateCursor should allow null elements in a list', () => {
+    const list = ['wow', null, 'cool'];
+
+    const spy = sandbox.spy();
+    dom.iterateCursor(list, spy);
+    expect(spy).to.be.calledThrice;
+  });
+
   function testScopedQuerySelector() {
     const grandparent = document.createElement('div');
 
@@ -463,13 +518,13 @@ describe('DOM', () => {
       parent.appendChild(child);
       const spy = sandbox.spy();
       dom.waitForChild(parent, contains, spy);
-      expect(spy.callCount).to.equal(1);
+      expect(spy).to.be.calledOnce;
     });
 
     it('should wait until child is available', () => {
       const spy = sandbox.spy();
       dom.waitForChild(parent, contains, spy);
-      expect(spy.callCount).to.equal(0);
+      expect(spy).to.have.not.been.called;
 
       return new Promise(resolve => {
         const interval = setInterval(() => {
@@ -480,7 +535,7 @@ describe('DOM', () => {
         }, 10);
         parent.appendChild(child);
       }).then(() => {
-        expect(spy.callCount).to.equal(1);
+        expect(spy).to.be.calledOnce;
       });
     });
 
@@ -505,8 +560,8 @@ describe('DOM', () => {
       const spy = sandbox.spy();
 
       dom.waitForChild(parent, checkFunc, spy);
-      expect(spy.callCount).to.equal(0);
-      expect(mutationObserver.observe.callCount).to.equal(1);
+      expect(spy).to.have.not.been.called;
+      expect(mutationObserver.observe).to.be.calledOnce;
       expect(mutationObserver.observe.firstCall.args[0]).to.equal(parent);
       expect(mutationObserver.observe.firstCall.args[1])
           .to.deep.equal({childList: true});
@@ -514,14 +569,14 @@ describe('DOM', () => {
 
       // False callback.
       mutationCallback();
-      expect(spy.callCount).to.equal(0);
-      expect(mutationObserver.disconnect.callCount).to.equal(0);
+      expect(spy).to.have.not.been.called;
+      expect(mutationObserver.disconnect).to.have.not.been.called;
 
       // True callback.
       checkFuncValue = true;
       mutationCallback();
-      expect(spy.callCount).to.equal(1);
-      expect(mutationObserver.disconnect.callCount).to.equal(1);
+      expect(spy).to.be.calledOnce;
+      expect(mutationObserver.disconnect).to.be.calledOnce;
     });
 
     it('should fallback to polling without MutationObserver', () => {
@@ -543,19 +598,19 @@ describe('DOM', () => {
       const spy = sandbox.spy();
 
       dom.waitForChild(parent, checkFunc, spy);
-      expect(spy.callCount).to.equal(0);
+      expect(spy).to.have.not.been.called;
       expect(intervalCallback).to.exist;
 
       // False callback.
       intervalCallback();
-      expect(spy.callCount).to.equal(0);
-      expect(win.clearInterval.callCount).to.equal(0);
+      expect(spy).to.have.not.been.called;
+      expect(win.clearInterval).to.have.not.been.called;
 
       // True callback.
       checkFuncValue = true;
       intervalCallback();
-      expect(spy.callCount).to.equal(1);
-      expect(win.clearInterval.callCount).to.equal(1);
+      expect(spy).to.be.calledOnce;
+      expect(win.clearInterval).to.be.calledOnce;
     });
 
     it('should wait for body', () => {
@@ -608,6 +663,18 @@ describe('DOM', () => {
       ancestor.appendChild(uncle);
       parent.appendChild(element);
       expect(dom.hasNextNodeInDocumentOrder(element)).to.be.true;
+    });
+
+    it('should return false when ancestor with sibling with stop node', () => {
+      const element = document.createElement('div');
+      const parent = document.createElement('div');
+      const uncle = document.createElement('div');
+      const ancestor = document.createElement('div');
+      ancestor.appendChild(parent);
+      ancestor.appendChild(uncle);
+      parent.appendChild(element);
+      expect(dom.hasNextNodeInDocumentOrder(element)).to.be.true;
+      expect(dom.hasNextNodeInDocumentOrder(element, parent)).to.be.false;
     });
   });
 
@@ -833,6 +900,47 @@ describe('DOM', () => {
       expect(dom.matches(div, 'div')).to.be.true;
       [ampEl, img1, iframe].map(el => {
         expect(dom.matches(el, 'div')).to.be.false;
+      });
+    });
+  });
+});
+
+describes.realWin('DOM', {
+  amp: { /* amp spec */
+    ampdoc: 'single',
+  },
+}, env => {
+  let doc;
+  class TestElement extends BaseElement {};
+  describe('whenUpgradeToCustomElement function', () => {
+    beforeEach(() => {
+      doc = env.win.document;
+    });
+
+    it('should not continue if element is not AMP element', () => {
+      const element = doc.createElement('div');
+      expect(() => dom.whenUpgradedToCustomElement(element)).to.throw(
+          'element is not AmpElement');
+    });
+
+    it('should resolve if element has already upgrade', () => {
+      const element = doc.createElement('amp-img');
+      doc.body.appendChild(element);
+      return dom.whenUpgradedToCustomElement(element).then(element => {
+        expect(element.whenBuilt).to.not.be.undefined;
+      });
+    });
+
+    it('should resolve when element upgrade', () => {
+      const element = doc.createElement('amp-test');
+      doc.body.appendChild(element);
+      env.win.setTimeout(() => {
+        doc.registerElement('amp-test', {
+          prototype: createAmpElementProto(env.win, 'amp-test', TestElement),
+        });
+      }, 100);
+      return dom.whenUpgradedToCustomElement(element).then(element => {
+        expect(element.whenBuilt).to.not.be.undefined;
       });
     });
   });

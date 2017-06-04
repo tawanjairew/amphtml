@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import {CommonSignals} from './common-signals';
 import {Layout, getLayoutClass, getLengthNumeral, getLengthUnits,
     isInternalElement, isLayoutSizeDefined, isLoadingAllowed,
     parseLayout, parseLength, getNaturalDimensions,
@@ -30,12 +31,16 @@ import {
 import {getMode} from './mode';
 import {parseSizeList} from './size-list';
 import {reportError} from './error';
-import {resourcesForDoc} from './resources';
-import {timerFor} from './timer';
-import {vsyncFor} from './vsync';
+import {
+  resourcesForDoc,
+  performanceForOrNull,
+  timerFor,
+  vsyncFor,
+} from './services';
 import * as dom from './dom';
 import {setStyle, setStyles} from './style';
-
+import {LayoutDelayMeter} from './layout-delay-meter';
+import {ResourceState} from './service/resource';
 
 const TAG_ = 'CustomElement';
 
@@ -214,18 +219,35 @@ export function copyElementToChildWindow(parentWin, childWin, name) {
  */
 export function upgradeElementInChildWindow(parentWin, childWin, name) {
   const toClass = getExtendedElements(parentWin)[name];
-  dev().assert(toClass, '%s is not stubbed yet', name);
+  // Some extensions unofficially register unstubbed elements, e.g. amp-bind.
+  // Can be changed to assert() once official support (#9143) is implemented.
+  if (!toClass) {
+    dev().warn(TAG_, '%s is not stubbed yet', name);
+  }
   dev().assert(toClass != ElementStub, '%s is not upgraded yet', name);
   upgradeOrRegisterElement(childWin, name, toClass);
 }
 
 /**
  * Applies layout to the element. Visible for testing only.
+ *
+ * \   \  /  \  /   / /   \     |   _  \     |  \ |  | |  | |  \ |  |  / _____|
+ *  \   \/    \/   / /  ^  \    |  |_)  |    |   \|  | |  | |   \|  | |  |  __
+ *   \            / /  /_\  \   |      /     |  . `  | |  | |  . `  | |  | |_ |
+ *    \    /\    / /  _____  \  |  |\  \----.|  |\   | |  | |  |\   | |  |__| |
+ *     \__/  \__/ /__/     \__\ | _| `._____||__| \__| |__| |__| \__|  \______|
+ *
+ * The equivalent of this method is used for server-side rendering (SSR) and
+ * any changes made to it must be made in coordination with caches that
+ * implement SSR. For more information on SSR see bit.ly/amp-ssr.
+ *
  * @param {!Element} element
  * @return {!Layout}
  */
 export function applyLayout_(element) {
-  // Check if the layout has already been done by the server.
+  // Check if the layout has already been done by server-side rendering. The
+  // document may be visible to the user if the boilerplate was removed so
+  // please take care in making changes here.
   const completedLayoutAttr = element.getAttribute('i-amphtml-layout');
   if (completedLayoutAttr) {
     const layout = /** @type {!Layout} */ (dev().assert(
@@ -234,9 +256,15 @@ export function applyLayout_(element) {
       // Find sizer, but assume that it might not have been parsed yet.
       element.sizerElement_ =
           element.querySelector('i-amphtml-sizer') || undefined;
+    } else if (layout == Layout.NODISPLAY) {
+      applyNoDisplayLayout_(element);
     }
     return layout;
   }
+
+  // If the layout was already done by server-side rendering (SSR), then the code
+  // below will not run. Any changes below will necessitate a change to SSR and must
+  // be coordinated with caches that implement SSR. See bit.ly/amp-ssr.
 
   // Parse layout from the element.
   const layoutAttr = element.getAttribute('layout');
@@ -318,7 +346,9 @@ export function applyLayout_(element) {
     element.classList.add('i-amphtml-layout-size-defined');
   }
   if (layout == Layout.NODISPLAY) {
-    setStyle(element, 'display', 'none');
+    // CSS defines layout=nodisplay automatically with `display:none`. Thus
+    // no additional styling is needed.
+    applyNoDisplayLayout_(element);
   } else if (layout == Layout.FIXED) {
     setStyles(element, {
       width: dev().assertString(width),
@@ -352,6 +382,18 @@ export function applyLayout_(element) {
     }
   }
   return layout;
+}
+
+
+/**
+ * @param {!Element} element
+ */
+function applyNoDisplayLayout_(element) {
+  // TODO(dvoytenko, #9353): once `toggleLayoutDisplay` API has been deployed
+  // everywhere, switch all relevant elements to this API. In the meantime,
+  // simply unblock display toggling via `style="display: ..."`.
+  setStyle(element, 'display', 'none');
+  element.classList.add('i-amphtml-display');
 }
 
 
@@ -533,9 +575,12 @@ function createBaseCustomElementClass(win) {
       /**
        * Action queue is initially created and kept around until the element
        * is ready to send actions directly to the implementation.
-       * @private {?Array<!./service/action-impl.ActionInvocation>}
+       * - undefined initially
+       * - array if used
+       * - null after unspun
+       * @private {?Array<!./service/action-impl.ActionInvocation>|undefined}
        */
-      this.actionQueue_ = [];
+      this.actionQueue_ = undefined;
 
       /**
        * Whether the element is in the template.
@@ -545,6 +590,19 @@ function createBaseCustomElementClass(win) {
 
       /** @private @const */
       this.signals_ = new Signals();
+
+      const perf = performanceForOrNull(win);
+      /** @private {boolean} */
+      this.perfOn_ = perf && perf.isPerformanceTrackingOn();
+
+      /** @private {?./layout-delay-meter.LayoutDelayMeter} */
+      this.layoutDelayMeter_ = null;
+
+      if (this[dom.UPGRADE_TO_CUSTOMELEMENT_RESOLVER]) {
+        this[dom.UPGRADE_TO_CUSTOMELEMENT_RESOLVER](this);
+        delete this[dom.UPGRADE_TO_CUSTOMELEMENT_RESOLVER];
+        delete this[dom.UPGRADE_TO_CUSTOMELEMENT_PROMISE];
+      }
     }
 
     /**
@@ -615,6 +673,10 @@ function createBaseCustomElementClass(win) {
       }
       this.implementation_ = new newImplClass(this);
       if (this.everAttached) {
+        // Usually, we do an implementation upgrade when the element is
+        // attached to the DOM. But, if it hadn't yet upgraded from
+        // ElementStub, we couldn't. Now that it's upgraded from a stub, go
+        // ahead and do the full upgrade.
         this.tryUpgrade_();
       }
     }
@@ -633,13 +695,9 @@ function createBaseCustomElementClass(win) {
       this.assertLayout_();
       this.implementation_.layout_ = this.layout_;
       this.implementation_.layoutWidth_ = this.layoutWidth_;
-      if (this.everAttached) {
-        this.implementation_.firstAttachedCallback();
-        this.dispatchCustomEventForTesting('amp:attached');
-        // For a never-added resource, the build will be done automatically
-        // via `resources.add` on the first attach.
-        this.getResources().upgraded(this);
-      }
+      this.implementation_.firstAttachedCallback();
+      this.dispatchCustomEventForTesting('amp:attached');
+      this.getResources().upgraded(this);
     }
 
     /* @private */
@@ -673,7 +731,7 @@ function createBaseCustomElementClass(win) {
      * @return {!Promise}
      */
     whenBuilt() {
-      return this.signals_.whenSignal('built');
+      return this.signals_.whenSignal(CommonSignals.BUILT);
     }
 
     /**
@@ -706,9 +764,9 @@ function createBaseCustomElementClass(win) {
         this.built_ = true;
         this.classList.remove('i-amphtml-notbuilt');
         this.classList.remove('amp-notbuilt');
-        this.signals_.signal('built');
+        this.signals_.signal(CommonSignals.BUILT);
       } catch (e) {
-        this.signals_.rejectSignal('built', e);
+        this.signals_.rejectSignal(CommonSignals.BUILT, e);
         reportError(e, this);
         throw e;
       }
@@ -716,14 +774,10 @@ function createBaseCustomElementClass(win) {
         this.updateInViewport_(true);
       }
       if (this.actionQueue_) {
-        if (this.actionQueue_.length > 0) {
-          // Only schedule when the queue is not empty, which should be
-          // the case 99% of the time.
-          timerFor(this.ownerDocument.defaultView)
+        // Only schedule when the queue is not empty, which should be
+        // the case 99% of the time.
+        timerFor(this.ownerDocument.defaultView)
             .delay(this.dequeueActions_.bind(this), 1);
-        } else {
-          this.actionQueue_ = null;
-        }
       }
       if (!this.getPlaceholder()) {
         const placeholder = this.createPlaceholder();
@@ -772,9 +826,13 @@ function createBaseCustomElementClass(win) {
       if (this.isUpgraded()) {
         this.implementation_.layoutWidth_ = this.layoutWidth_;
       }
-      // TODO(malteubl): Forward for stubbed elements.
-      // TODO(jridgewell): We should pass the layoutBox down.
-      this.implementation_.onLayoutMeasure();
+      if (this.isBuilt()) {
+        try {
+          this.implementation_.onLayoutMeasure();
+        } catch (e) {
+          reportError(e, this);
+        }
+      }
 
       if (this.isLoadingEnabled_()) {
         if (this.isInViewport_) {
@@ -904,6 +962,9 @@ function createBaseCustomElementClass(win) {
           setStyle(this, 'marginLeft', opt_newMargins.left, 'px');
         }
       }
+      if (this.isAwaitingSize_()) {
+        this.sizeProvided_();
+      }
     }
 
     /**
@@ -933,35 +994,53 @@ function createBaseCustomElementClass(win) {
         // Resources can now be initialized since the ampdoc is now available.
         this.resources_ = resourcesForDoc(this.ampdoc_);
       }
-      if (!this.everAttached) {
+      this.getResources().add(this);
+
+      if (this.everAttached) {
+        const reconstruct = this.reconstructWhenReparented();
+        if (reconstruct) {
+          this.reset_();
+        }
+        if (this.isUpgraded()) {
+          if (reconstruct) {
+            this.getResources().upgraded(this);
+          }
+          this.dispatchCustomEventForTesting('amp:attached');
+        }
+      } else {
+        this.everAttached = true;
+
+        try {
+          this.layout_ = applyLayout_(this);
+        } catch (e) {
+          reportError(e, this);
+        }
         if (!isStub(this.implementation_)) {
           this.tryUpgrade_();
         }
         if (!this.isUpgraded()) {
           this.classList.add('amp-unresolved');
           this.classList.add('i-amphtml-unresolved');
+          // amp:attached is dispatched from the ElementStub class when it
+          // replayed the firstAttachedCallback call.
+          this.dispatchCustomEventForTesting('amp:stubbed');
         }
-        try {
-          this.layout_ = applyLayout_(this);
-          this.assertLayout_();
-          this.implementation_.layout_ = this.layout_;
-          this.implementation_.firstAttachedCallback();
-          if (!this.isUpgraded()) {
-            // amp:attached is dispatched from the ElementStub class when it
-            // replayed the firstAttachedCallback call.
-            this.dispatchCustomEventForTesting('amp:stubbed');
-          } else {
-            this.dispatchCustomEventForTesting('amp:attached');
-          }
-        } catch (e) {
-          reportError(e, this);
-        }
-
-        // It's important to have this flag set in the end to avoid
-        // `resources.add` called twice if upgrade happens immediately.
-        this.everAttached = true;
       }
-      this.getResources().add(this);
+    }
+
+    /**
+     * @return {boolean}
+     * @private
+     */
+    isAwaitingSize_() {
+      return this.classList.contains('i-amphtml-layout-awaiting-size');
+    }
+
+    /**
+     * @private
+     */
+    sizeProvided_() {
+      this.classList.remove('i-amphtml-layout-awaiting-size');
     }
 
     /** The Custom Elements V0 sibling to `connectedCallback`. */
@@ -991,7 +1070,9 @@ function createBaseCustomElementClass(win) {
         this.completeUpgrade_(impl);
       } else if (typeof res.then == 'function') {
         // It's a promise: wait until it's done.
-        res.then(impl => this.completeUpgrade_(impl)).catch(reason => {
+        res.then(upgrade => {
+          this.completeUpgrade_(upgrade || impl);
+        }).catch(reason => {
           this.upgradeState_ = UpgradeState.UPGRADE_FAILED;
           rethrowAsync(reason);
         });
@@ -1077,11 +1158,24 @@ function createBaseCustomElementClass(win) {
     }
 
     /**
+     * Returns a previously measured layout box adjusted to the viewport. This
+     * mainly affects fixed-position elements that are adjusted to be always
+     * relative to the document position in the viewport.
      * @return {!./layout-rect.LayoutRectDef}
      * @final @this {!Element}
      */
     getLayoutBox() {
       return this.getResources().getResourceForElement(this).getLayoutBox();
+    }
+
+    /**
+     * Returns a previously measured layout box relative to the page. The
+     * fixed-position elements are relative to the top of the document.
+     * @return {!./layout-rect.LayoutRectDef}
+     * @final @this {!Element}
+     */
+    getPageLayoutBox() {
+      return this.getResources().getResourceForElement(this).getPageLayoutBox();
     }
 
     /**
@@ -1116,6 +1210,14 @@ function createBaseCustomElementClass(win) {
     }
 
     /**
+     * Returns the current resource state of the element.
+     * @return {!ResourceState}
+     */
+    getResourceState_() {
+      return this.getResources().getResourceForElement(this).getState();
+    }
+
+    /**
      * The runtime calls this method to determine if {@link layoutCallback}
      * should be called again when layout changes.
      * @return {boolean}
@@ -1123,6 +1225,14 @@ function createBaseCustomElementClass(win) {
      */
     isRelayoutNeeded() {
       return this.implementation_.isRelayoutNeeded();
+    }
+
+    /**
+     * Returns reference to implementation after it has been built.
+     * @return {!Promise<!./base-element.BaseElement>}
+     */
+    getImpl() {
+      return this.whenBuilt().then(() => this.implementation_);
     }
 
     /**
@@ -1146,14 +1256,17 @@ function createBaseCustomElementClass(win) {
       this.dispatchCustomEventForTesting('amp:load:start');
       const isLoadEvent = (this.layoutCount_ == 0);  // First layout is "load".
       if (isLoadEvent) {
-        this.signals_.signal('load-start');
+        this.signals_.signal(CommonSignals.LOAD_START);
+      }
+      if (this.perfOn_) {
+        this.getLayoutDelayMeter_().startLayout();
       }
       const promise = this.implementation_.layoutCallback();
       this.preconnect(/* onLayout */true);
       this.classList.add('i-amphtml-layout');
       return promise.then(() => {
         if (isLoadEvent) {
-          this.signals_.signal('load-end');
+          this.signals_.signal(CommonSignals.LOAD_END);
         }
         this.readyState = 'complete';
         this.layoutCount_++;
@@ -1163,13 +1276,15 @@ function createBaseCustomElementClass(win) {
         if (!this.isFirstLayoutCompleted_) {
           this.implementation_.firstLayoutCompleted();
           this.isFirstLayoutCompleted_ = true;
+          // TODO(dvoytenko, #7389): cleanup once amp-sticky-ad signals are
+          // in PROD.
           this.dispatchCustomEvent('amp:load:end');
         }
       }, reason => {
         // add layoutCount_ by 1 despite load fails or not
         if (isLoadEvent) {
           this.signals_.rejectSignal(
-              'load-end', /** @type {!Error} */ (reason));
+              CommonSignals.LOAD_END, /** @type {!Error} */ (reason));
         }
         this.layoutCount_++;
         this.toggleLoading_(false, /* cleanup */ true);
@@ -1196,7 +1311,12 @@ function createBaseCustomElementClass(win) {
           // Set a minimum delay in case the element loads very fast or if it
           // leaves the viewport.
           timerFor(this.ownerDocument.defaultView).delay(() => {
-            if (this.layoutCount_ == 0 && this.isInViewport_) {
+            // TODO(dvoytenko, #9177): cleanup `this.ownerDocument.defaultView`
+            // once investigation is complete. It appears that we get a lot of
+            // errors here once the iframe is destroyed due to timer.
+            if (this.isInViewport_ &&
+                this.ownerDocument &&
+                this.ownerDocument.defaultView) {
               this.toggleLoading_(true);
             }
           }, 100);
@@ -1214,6 +1334,9 @@ function createBaseCustomElementClass(win) {
     updateInViewport_(inViewport) {
       this.implementation_.inViewport_ = inViewport;
       this.implementation_.viewportCallback(inViewport);
+      if (inViewport && this.perfOn_) {
+        this.getLayoutDelayMeter_().enterViewport();
+      }
     }
 
     /**
@@ -1262,10 +1385,19 @@ function createBaseCustomElementClass(win) {
       }
       const isReLayoutNeeded = this.implementation_.unlayoutCallback();
       if (isReLayoutNeeded) {
-        this.layoutCount_ = 0;
-        this.isFirstLayoutCompleted_ = false;
+        this.reset_();
       }
       return isReLayoutNeeded;
+    }
+
+    /** @private */
+    reset_() {
+      this.layoutCount_ = 0;
+      this.isFirstLayoutCompleted_ = false;
+      this.signals_.reset(CommonSignals.RENDER_START);
+      this.signals_.reset(CommonSignals.LOAD_START);
+      this.signals_.reset(CommonSignals.LOAD_END);
+      this.signals_.reset(CommonSignals.INI_LOAD);
     }
 
     /**
@@ -1295,7 +1427,6 @@ function createBaseCustomElementClass(win) {
     /**
      * Collapses the element, and notifies its owner (if there is one) that the
      * element is no longer present.
-     * @suppress {missingProperties}
      */
     collapse() {
       this.implementation_./*OK*/collapse();
@@ -1304,10 +1435,25 @@ function createBaseCustomElementClass(win) {
     /**
      * Called every time an owned AmpElement collapses itself.
      * @param {!AmpElement} element
-     * @suppress {missingProperties}
      */
     collapsedCallback(element) {
       this.implementation_.collapsedCallback(element);
+    }
+
+    /**
+     * Expands the element, and notifies its owner (if there is one) that the
+     * element is now present.
+     */
+    expand() {
+      this.implementation_./*OK*/expand();
+    }
+
+    /**
+     * Called every time an owned AmpElement expands itself.
+     * @param {!AmpElement} element
+     */
+    expandedCallback(element) {
+      this.implementation_.expandedCallback(element);
     }
 
     /**
@@ -1324,6 +1470,18 @@ function createBaseCustomElementClass(win) {
     }
 
     /**
+     * Returns an array of elements in this element's subtree that this
+     * element owns that could have children added or removed dynamically.
+     * The array should not contain any ancestors of this element, but could
+     * contain this element itself.
+     * @return {Array<!Element>}
+     * @public
+     */
+    getDynamicElementContainers() {
+      return this.implementation_.getDynamicElementContainers();
+    }
+
+    /**
      * Enqueues the action with the element. If element has been upgraded and
      * built, the action is dispatched to the implementation right away.
      * Otherwise the invocation is enqueued until the implementation is ready
@@ -1334,6 +1492,9 @@ function createBaseCustomElementClass(win) {
     enqueAction(invocation) {
       assertNotTemplate(this);
       if (!this.isBuilt()) {
+        if (this.actionQueue_ === undefined) {
+          this.actionQueue_ = [];
+        }
         dev().assert(this.actionQueue_).push(invocation);
       } else {
         this.executionAction_(invocation, false);
@@ -1353,7 +1514,7 @@ function createBaseCustomElementClass(win) {
       const actionQueue = dev().assert(this.actionQueue_);
       this.actionQueue_ = null;
 
-      // TODO(dvoytenko, #1260): dedupe actions.
+      // Notice, the actions are currently not de-duped.
       actionQueue.forEach(invocation => {
         this.executionAction_(invocation, true);
       });
@@ -1395,6 +1556,15 @@ function createBaseCustomElementClass(win) {
     getRealChildren() {
       return dom.childElements(this, element =>
         !isInternalOrServiceNode(element));
+    }
+
+    /**
+     * Must be executed in the mutate context. Removes `display:none` from the
+     * element set via `layout=nodisplay`.
+     * @param {boolean} displayOn
+     */
+    toggleLayoutDisplay(displayOn) {
+      this.classList.toggle('i-amphtml-display', displayOn);
     }
 
     /**
@@ -1444,22 +1614,40 @@ function createBaseCustomElementClass(win) {
     /**
      * Hides or shows the fallback, if available. This function must only
      * be called inside a mutate context.
-     * @param {boolean} state
+     * @param {boolean} show
      * @package @final @this {!Element}
      */
-    toggleFallback(state) {
+    toggleFallback(show) {
       assertNotTemplate(this);
+      const resourceState = this.getResourceState_();
+      // Do not show fallback before layout
+      if (show && (resourceState == ResourceState.NOT_BUILT ||
+          resourceState == ResourceState.NOT_LAID_OUT ||
+          resourceState == ResourceState.READY_FOR_LAYOUT)) {
+        return;
+      }
       // This implementation is notably less efficient then placeholder toggling.
       // The reasons for this are: (a) "not supported" is the state of the whole
       // element, (b) some realyout is expected and (c) fallback condition would
       // be rare.
-      this.classList.toggle('amp-notsupported', state);
-      if (state == true) {
+      this.classList.toggle('amp-notsupported', show);
+      if (show == true) {
         const fallbackElement = this.getFallback();
         if (fallbackElement) {
           this.getResources().scheduleLayout(this, fallbackElement);
         }
       }
+    }
+
+    /**
+     * An implementation can call this method to signal to the element that
+     * it has started rendering.
+     * @package @final @this {!Element}
+     */
+    renderStarted() {
+      this.signals_.signal(CommonSignals.RENDER_START);
+      this.togglePlaceholder(false);
+      this.toggleLoading_(false);
     }
 
     /**
@@ -1520,6 +1708,12 @@ function createBaseCustomElementClass(win) {
      */
     toggleLoading_(state, opt_cleanup) {
       assertNotTemplate(this);
+      if (state &&
+          (this.layoutCount_ > 0 ||
+              this.signals_.get(CommonSignals.RENDER_START))) {
+        // Loading has already been canceled. Ignore.
+        return;
+      }
       this.loadingState_ = state;
       if (!state && !this.loadingContainer_) {
         return;
@@ -1557,6 +1751,18 @@ function createBaseCustomElementClass(win) {
           });
         }
       });
+    }
+
+    /**
+     * Returns an optional overflow element for this custom element.
+     * @return {!./layout-delay-meter.LayoutDelayMeter}
+     */
+    getLayoutDelayMeter_() {
+      if (!this.layoutDelayMeter_) {
+        this.layoutDelayMeter_ = new LayoutDelayMeter(
+            this.ownerDocument.defaultView, this.getPriority());
+      }
+      return this.layoutDelayMeter_;
     }
 
     /**
@@ -1704,6 +1910,8 @@ function assertNotTemplate(element) {
  * @return {!./service/vsync-impl.Vsync}
  */
 function getVsync(element) {
+  // TODO(dvoytenko, #9177): consider removing this and always resolving via
+  // `createCustomElementClass(win)` object.
   return vsyncFor(element.ownerDocument.defaultView);
 };
 

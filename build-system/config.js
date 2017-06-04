@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+'use strict';
 
 var commonTestPaths = [
   'test/_init_tests.js',
@@ -57,6 +58,7 @@ var testPaths = commonTestPaths.concat([
 
 var integrationTestPaths = commonTestPaths.concat([
   'test/integration/**/*.js',
+  'test/functional/test-error.js',
   'extensions/**/test/integration/**/*.js',
 ]);
 
@@ -78,6 +80,7 @@ module.exports = {
     '!karma.conf.js',
     '!**/local-amp-chrome-extension/background.js',
     '!extensions/amp-access/0.1/access-expr-impl.js',
+    '!extensions/amp-animation/0.1/css-expr-impl.js',
     '!extensions/amp-bind/0.1/bind-expr-impl.js',
   ],
   presubmitGlobs: [

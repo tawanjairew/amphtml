@@ -30,10 +30,11 @@ import {
 } from '../../src/service';
 import {installPlatformService} from '../../src/service/platform-impl';
 import {installTimerService} from '../../src/service/timer-impl';
-import {platformFor} from '../../src/platform';
+import {vsyncForTesting} from '../../src/service/vsync-impl';
+import {platformFor} from '../../src/services';
 import {runChunksForTesting} from '../../src/chunk';
-import {timerFor} from '../../src/timer';
 import {toggleExperiment} from '../../src/experiments';
+import {extensionsFor} from '../../src/services';
 import * as ext from '../../src/service/extensions-impl';
 import * as extel from '../../src/extended-element';
 import * as styles from '../../src/style-installer';
@@ -45,12 +46,14 @@ describes.fakeWin('runtime', {
   location: 'https://cdn.ampproject.org/c/s/www.example.com/path',
 }, env => {
   let win;
+  let clock;
   let ampdocService;
   let ampdocServiceMock;
   let extensionElementIndex;
 
   beforeEach(() => {
     win = env.win;
+    clock = env.sandbox.useFakeTimers();
     extensionElementIndex = 0;
     ampdocService = {
       isSingleDoc: () => true,
@@ -66,6 +69,7 @@ describes.fakeWin('runtime', {
     ampdocService.getAmpDoc = () => ampdoc;
     installPlatformService(win);
     installTimerService(win);
+    vsyncForTesting(win);
     installAmpdocServices(ampdoc);
   });
 
@@ -140,7 +144,7 @@ describes.fakeWin('runtime', {
     expect(win.document.documentElement.style.cursor).to.equal('pointer');
   });
 
-  it('should execute scheduled extensions & execute new extensions', () => {
+  const extensionRegistrationTest = () => {
     let progress = '';
     const queueExtensions = win.AMP;
     win.AMP.push(regularExtension(amp => {
@@ -173,6 +177,88 @@ describes.fakeWin('runtime', {
     runChunksForTesting(win.document);
     expect(progress).to.equal('12345');
     expect(queueExtensions).to.have.length(0);
+  };
+  it('should execute scheduled extensions & execute new extensions',
+      extensionRegistrationTest);
+
+  it('should not maybePumpEarlyFrame when body not yet present', () => {
+    toggleExperiment(win, 'pump-early-frame', true);
+    // Make document.body be null on first invocation to simulate
+    // JS executing before the rest of the doc has been parsed.
+    const body = win.document.body;
+    let accessedOnce = false;
+    Object.defineProperty(win.document, 'body', {
+      get: () => {
+        if (accessedOnce) {
+          return body;
+        }
+        accessedOnce = true;
+        return null;
+      },
+    });
+    extensionRegistrationTest();
+  });
+
+  it('should not maybePumpEarlyFrame ' +
+      'when a renderDelayingExtension is present', () => {
+    toggleExperiment(win, 'pump-early-frame', true);
+    win.document.body.appendChild(
+            document.createElement('amp-experiment'));
+    extensionRegistrationTest();
+  });
+
+  it('should maybePumpEarlyFrame and delay extension execution', () => {
+    toggleExperiment(win, 'pump-early-frame', true);
+    let progress = '';
+    const queueExtensions = win.AMP;
+    const highPriority = regularExtension(amp => {
+      expect(amp).to.equal(win.AMP);
+      progress += 'high';
+    });
+    highPriority.p = 'high';
+    win.AMP.push(highPriority);
+    win.AMP.push(regularExtension(amp => {
+      expect(amp).to.equal(win.AMP);
+      progress += '1';
+    }));
+    win.AMP.push(regularExtension(amp => {
+      expect(amp).to.equal(win.AMP);
+      progress += '2';
+    }));
+    win.AMP.push(() => {
+      progress += 'function';
+    });
+    win.AMP.push(regularExtension(amp => {
+      expect(amp).to.equal(win.AMP);
+      progress += '3';
+    }));
+    expect(queueExtensions).to.have.length(5);
+    adopt(win);
+    runChunksForTesting(win.document);
+    return Promise.resolve().then(() => {
+      expect(progress).to.equal('highfunction');
+      expect(queueExtensions).to.have.length(3);
+      clock.tick();
+      expect(queueExtensions).to.have.length(3);
+      expect(progress).to.equal('highfunction');
+      // New extension arrives before inital ran.
+      win.AMP.push(regularExtension(amp => {
+        expect(amp).to.equal(win.AMP);
+        progress += '4';
+      }));
+      expect(queueExtensions).to.have.length(4);
+      clock.tick(1);
+      expect(queueExtensions).to.have.length(0);
+      runChunksForTesting(win.document);
+      expect(progress).to.equal('highfunction1234');
+      win.AMP.push(regularExtension(amp => {
+        expect(amp).to.equal(win.AMP);
+        progress += '5';
+      }));
+      runChunksForTesting(win.document);
+      expect(progress).to.equal('highfunction12345');
+      expect(queueExtensions).to.have.length(0);
+    });
   });
 
   it('support struct AMP.push raw functions and high priority', () => {
@@ -226,7 +312,8 @@ describes.fakeWin('runtime', {
 
         expect(progress).to.equal('1HIGHAB2');
 
-        const extensions = ext.installExtensionsService(win);
+        ext.installExtensionsService(win);
+        const extensions = extensionsFor(win);
         const ext1 = extensions.waitForExtension('ext1');
         const ext2 = extensions.waitForExtension('ext2');
         return Promise.all([ext1, ext2]);
@@ -368,7 +455,8 @@ describes.fakeWin('runtime', {
 
     beforeEach(() => {
       adopt(win);
-      extensions = ext.installExtensionsService(win);
+      ext.installExtensionsService(win);
+      extensions = extensionsFor(win);
       registerStub = sandbox.stub(extel, 'registerExtendedElement');
     });
 
@@ -384,6 +472,7 @@ describes.fakeWin('runtime', {
       expect(win.AMP.viewport).to.be.a('object');
       // Single-doc mode does not create `attachShadowDoc`.
       expect(win.AMP.attachShadowDoc).to.not.exist;
+      expect(win.AMP.attachShadowDocAsStream).to.not.exist;
     });
 
     it('should register element without CSS', () => {
@@ -405,11 +494,11 @@ describes.fakeWin('runtime', {
           .to.equal(win.AMP.BaseElement);
 
       // No installStyles calls.
-      expect(installStylesStub.callCount).to.equal(0);
+      expect(installStylesStub).to.have.not.been.called;
 
       // Register is called immediately as well.
-      expect(registerStub.calledWithExactly(win, 'amp-ext', AMP.BaseElement))
-          .to.be.true;
+      expect(registerStub)
+          .to.be.calledWithExactly(win, 'amp-ext', AMP.BaseElement);
 
       // Service and extensions are resolved.
       return Promise.all([
@@ -440,20 +529,20 @@ describes.fakeWin('runtime', {
           .to.equal(win.AMP.BaseElement);
       expect(ext.elements['amp-ext'].css).to.equal('a{}');
 
-      expect(installStylesStub.callCount).to.equal(1);
-      expect(installStylesStub.calledWithExactly(
+      expect(installStylesStub).to.be.calledOnce;
+      expect(installStylesStub).to.be.calledWithExactly(
           win.document,
           'a{}',
           installStylesCallback,
           /* isRuntimeCss */ false,
-          /* ext */ 'amp-ext')).to.be.true;
+          /* ext */ 'amp-ext');
 
       // Element resistration is not done until callback.
-      expect(registerStub.callCount).to.equal(0);
+      expect(registerStub).to.have.not.been.called;
       installStylesCallback();
-      expect(registerStub.callCount).to.equal(1);
-      expect(registerStub.calledWithExactly(win, 'amp-ext',
-          AMP.BaseElement)).to.be.true;
+      expect(registerStub).to.be.calledOnce;
+      expect(registerStub).to.be.calledWithExactly(win, 'amp-ext',
+          AMP.BaseElement);
 
       // Service and extensions are resolved.
       return Promise.all([
@@ -487,8 +576,10 @@ describes.fakeWin('runtime', {
     });
 
     it('should register doc-service factory and install it immediately', () => {
+      let count = 0;
       function factory() {
-        return 'A';
+        count++;
+        return {str: 'A'};
       }
       const ampdoc = new AmpDocSingle(win);
       ampdocServiceMock.expects('getAmpDoc')
@@ -497,7 +588,7 @@ describes.fakeWin('runtime', {
       win.AMP.push({
         n: 'amp-ext',
         f: amp => {
-          amp.registerServiceForDoc('service1', undefined, factory);
+          amp.registerServiceForDoc('service1', factory);
         },
       });
       runChunksForTesting(win.document);
@@ -507,7 +598,8 @@ describes.fakeWin('runtime', {
       expect(extHolder.docFactories).to.have.length(0);
 
       // Already installed.
-      expect(getServiceForDoc(ampdoc, 'service1')).to.equal('A');
+      expect(count).to.equal(1);
+      expect(getServiceForDoc(ampdoc, 'service1')).to.deep.equal({str: 'A'});
     });
   });
 
@@ -517,7 +609,8 @@ describes.fakeWin('runtime', {
 
     beforeEach(() => {
       adoptShadowMode(win);
-      extensions = ext.installExtensionsService(win);
+      ext.installExtensionsService(win);
+      extensions = extensionsFor(win);
       registerStub = sandbox.stub(extel, 'registerExtendedElement');
     });
 
@@ -530,6 +623,7 @@ describes.fakeWin('runtime', {
       expect(win.AMP.win).to.equal(win);
 
       expect(win.AMP.attachShadowDoc).to.be.a('function');
+      expect(win.AMP.attachShadowDocAsStream).to.be.a('function');
 
       expect(win.AMP.viewer).to.not.exist;
       expect(win.AMP.viewport).to.not.exist;
@@ -556,13 +650,13 @@ describes.fakeWin('runtime', {
           .to.equal(win.AMP.BaseElement);
 
       // No installStyles calls and no factories.
-      expect(installStylesStub.callCount).to.equal(0);
+      expect(installStylesStub).to.have.not.been.called;
       expect(extHolder.docFactories).to.have.length(0);
       expect(extHolder.shadowRootFactories).to.have.length(0);
 
       // Register is called immediately as well.
-      expect(registerStub.calledWithExactly(win, 'amp-ext', AMP.BaseElement))
-          .to.be.true;
+      expect(registerStub).to.be.calledWithExactly(
+          win, 'amp-ext', AMP.BaseElement);
 
       // Service and extensions are resolved.
       return Promise.all([
@@ -592,22 +686,22 @@ describes.fakeWin('runtime', {
       expect(ext.elements['amp-ext'].css).to.equal('a{}');
 
       // Register is called immediately as well.
-      expect(registerStub.calledWithExactly(win, 'amp-ext', AMP.BaseElement))
-          .to.be.true;
+      expect(registerStub).to.be.calledWithExactly(
+          win, 'amp-ext', AMP.BaseElement);
 
       // No installStyles calls, but there's a factory.
-      expect(installStylesStub.callCount).to.equal(0);
+      expect(installStylesStub).to.have.not.been.called;
       expect(extHolder.shadowRootFactories).to.have.length(1);
 
       // Execute factory to install style.
       const shadowRoot = document.createDocumentFragment();
       extHolder.shadowRootFactories[0](shadowRoot);
-      expect(installStylesStub.callCount).to.equal(1);
-      expect(installStylesStub.calledWithExactly(
+      expect(installStylesStub).to.be.calledOnce;
+      expect(installStylesStub).to.be.calledWithExactly(
           shadowRoot,
           'a{}',
           /* isRuntimeCss */ false,
-          /* ext */ 'amp-ext')).to.be.true;
+          /* ext */ 'amp-ext');
 
       // Service and extensions are resolved.
       return Promise.all([
@@ -958,12 +1052,355 @@ describes.realWin('runtime multidoc', {
   });
 
 
+  describe('attachShadowDocAsStream', () => {
+    const docUrl = 'https://example.org/doc1';
+
+    let hostElement;
+    let ampdoc;
+    let shadowDoc;
+    let writer;
+
+    beforeEach(() => {
+      deactivateChunking();
+      hostElement = win.document.createElement('div');
+      const shadowRoot = shadowembed.createShadowRoot(hostElement);
+      ampdoc = new AmpDocShadow(win, docUrl, shadowRoot);
+
+      ampdocServiceMock.expects('installShadowDoc_')
+          .withExactArgs(
+              docUrl,
+              sinon.match(arg => arg == getShadowRoot(hostElement)))
+          .returns(ampdoc)
+          .atLeast(0);
+      ampdocServiceMock.expects('getAmpDoc')
+          .withExactArgs(sinon.match(arg => arg == getShadowRoot(hostElement)))
+          .returns(ampdoc)
+          .atLeast(0);
+    });
+
+    it('should install services and styles', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+
+      const shadowRoot = getShadowRoot(hostElement);
+
+      // URL is set.
+      expect(shadowRoot.AMP.url).to.equal(docUrl);
+
+      // Stylesheet has been installed.
+      expect(shadowRoot.querySelector('style[amp-runtime]')).to.exist;
+
+      // Doc services have been installed.
+      expect(ampdoc.services.action).to.exist;
+      expect(ampdoc.services.action.obj).to.exist;
+      expect(ampdoc.services.viewer).to.exist;
+      expect(ampdoc.services.viewer.obj).to.exist;
+
+      // Single-doc bidings have been installed.
+      expect(shadowDoc.ampdoc).to.equal(ampdoc);
+      expect(shadowDoc.viewer).to.not.exist;
+    });
+
+    it('should install doc services', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+
+      class Service1 {}
+      win.AMP.push({
+        n: 'amp-ext',
+        f: amp => {
+          amp.registerServiceForDoc('service1', Service1);
+        },
+      });
+
+      writer.write('<script custom-element="amp-ext" src=""></script>');
+      writer.write('<body>');
+
+      return ampdoc.whenBodyAvailable().then(() => {
+        return extensions.waitForExtension('amp-ext').then(() => {
+          // Factories have been applied.
+          expect(getServiceForDoc(ampdoc, 'service1'))
+              .to.be.instanceOf(Service1);
+        });
+      });
+    });
+
+    it('should pass init parameters to viewer', () => {
+      win.AMP.attachShadowDocAsStream(hostElement, docUrl, {
+        'test1': '12',
+      });
+      const viewer = getServiceForDoc(ampdoc, 'viewer');
+      expect(viewer.getParam('test1')).to.equal('12');
+    });
+
+    it('should update host visibility', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+
+      writer.write('<body><div>');
+
+      // Document is invisible at first.
+      expect(hostElement.style.visibility).to.equal('hidden');
+
+      return ampdoc.whenBodyAvailable().then(() => {
+        // After timeout the doc rendered is started.
+        expect(hostElement.style.visibility).to.equal('hidden');
+        return ampdoc.signals().whenSignal('render-start');
+      }).then(() => {
+        expect(hostElement.style.visibility).to.equal('visible');
+      });
+    });
+
+    it('should import body', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<body><child>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const shadowRoot = getShadowRoot(hostElement);
+        const body = shadowRoot.querySelector('body') ||
+            shadowRoot.querySelector('amp-body');
+        expect(body).to.exist;
+        expect(body).to.have.class('amp-shadow');
+        expect(body.style.position).to.equal('relative');
+        env.flushVsync();
+        expect(body.querySelector('child')).to.exist;
+        expect(ampdoc.getBody()).to.exist;
+      });
+    });
+
+    it('should mark doc as ready', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<body><child>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(ampdoc.isReady()).to.be.false;
+        writer.write('</child></body>');
+        writer.write('</html>');
+        writer.close();
+        return ampdoc.whenReady().then(() => {
+          expect(ampdoc.isReady()).to.be.true;
+        });
+      });
+    });
+
+    it('should read title element', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<title>test title</title><body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(shadowDoc.title).to.equal('test title');
+        expect(getShadowRoot(hostElement).AMP.title).to.equal('test title');
+      });
+    });
+
+    it('should read canonical element', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write(
+          '<link rel="canonical" href="http://example.org/canonical"><body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(shadowDoc.canonicalUrl).to.equal('http://example.org/canonical');
+      });
+    });
+
+    it('should import fonts', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+
+      writer.write(
+          '<link rel="stylesheet" href="http://example.org/font1"><body>');
+      writer.write(
+          '<link rel="stylesheet" href="http://example.org/font2"><body>');
+      const fontEl2 = win.document.createElement('link');
+      fontEl2.setAttribute('rel', 'stylesheet');
+      fontEl2.setAttribute('href', 'http://example.org/font2');
+      win.document.head.appendChild(fontEl2);
+
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(win.document.querySelector(
+            'link[href="http://example.org/font1"]')).to.exist;
+        // Duplicates are ignored.
+        expect(win.document.querySelectorAll(
+            'link[href="http://example.org/font2"]')).to.have.length(1);
+
+        const fontEl = win.document.querySelector(
+            'link[href="http://example.org/font1"]');
+        expect(fontEl.getAttribute('type')).to.equal('text/css');
+        expect(fontEl.getAttribute('rel')).to.equal('stylesheet');
+        fontEl.parentElement.removeChild(fontEl);
+      });
+    });
+
+    it('should ignore boilerplate style', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<style amp-boilerplate></style><body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const shadowRoot = getShadowRoot(hostElement);
+        expect(shadowRoot.querySelector('style[amp-boilerplate]')).to.not.exist;
+      });
+    });
+
+    it('should import custom style', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<style amp-custom>.custom{}</style><body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const shadowRoot = getShadowRoot(hostElement);
+        expect(shadowRoot.querySelector('style[amp-custom]')).to.exist;
+        expect(shadowRoot.querySelector('style[amp-custom]').textContent)
+            .to.contain('.custom');
+      });
+    });
+
+    it('should ignore runtime extension', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      extensionsMock.expects('loadExtension').never();
+      writer.write(
+          '<script src="https://cdn.ampproject.org/v0.js"></script>');
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable();
+    });
+
+    it('should ignore unknown script', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      extensionsMock.expects('loadExtension').never();
+      writer.write(
+          '<script data-id="unknown1"' +
+          ' src="https://cdn.ampproject.org/other.js"></script>');
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(getShadowRoot(hostElement)
+            .querySelector('script[data-id="unknown1"]')).to.not.exist;
+        expect(win.document.querySelector('script[data-id="unknown1"]'))
+            .to.not.exist;
+      });
+    });
+
+    it('should import extension element', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      extensionsMock.expects('loadExtension')
+          .withExactArgs('amp-ext1')
+          .returns(Promise.resolve({
+            elements: {
+              'amp-ext1': function() {},
+            },
+          }))
+          .once();
+      writer.write(
+          '<script custom-element="amp-ext1" src=""></script>');
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(win.document.querySelector('script[custom-element="amp-ext1"]'))
+            .to.not.exist;
+      });
+    });
+
+    it('should import extension template', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      extensionsMock.expects('loadExtension')
+          .withExactArgs('amp-ext1')
+          .returns(Promise.resolve({elements: {}}))
+          .once();
+      writer.write(
+          '<script custom-template="amp-ext1" src=""></script>');
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(win.document.querySelector('script[custom-template="amp-ext1"]'))
+            .to.not.exist;
+      });
+    });
+
+    it('should import inline script', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write(
+          '<script type="application/json" data-id="test1">{}</script>');
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        expect(getShadowRoot(hostElement)
+            .querySelector('script[data-id="test1"]')).to.exist;
+        expect(getShadowRoot(hostElement).querySelector(
+            'script[data-id="test1"]').textContent).to.equal('{}');
+      });
+    });
+
+    it('should ignore inline script if javascript', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write(
+          '<script type="application/javascript" data-id="test1"></script>');
+      writer.write(
+          '<script data-id="test1"></script>');
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable(() => {
+        expect(getShadowRoot(hostElement)
+            .querySelector('script[data-id="test1"]')).to.not.exist;
+      });
+    });
+
+    it('should start as visible by default', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const viewer = getServiceForDoc(ampdoc, 'viewer');
+        expect(viewer.getVisibilityState()).to.equal('visible');
+      });
+    });
+
+    it('should start as prerender when requested', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl, {
+        'visibilityState': 'prerender',
+      });
+      writer = shadowDoc.writer;
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const viewer = getServiceForDoc(ampdoc, 'viewer');
+        expect(viewer.getVisibilityState()).to.equal('prerender');
+      });
+    });
+
+    it('should expose visibility method', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const viewer = getServiceForDoc(ampdoc, 'viewer');
+        expect(shadowDoc.setVisibilityState).to.be.function;
+        expect(viewer.getVisibilityState()).to.equal('visible');
+
+        shadowDoc.setVisibilityState('inactive');
+        expect(viewer.getVisibilityState()).to.equal('inactive');
+      });
+    });
+
+    it('should expose close method and dispose services', () => {
+      shadowDoc = win.AMP.attachShadowDocAsStream(hostElement, docUrl);
+      writer = shadowDoc.writer;
+      writer.write('<body>');
+      return ampdoc.whenBodyAvailable().then(() => {
+        const viewer = getServiceForDoc(ampdoc, 'viewer');
+        expect(shadowDoc.close).to.be.function;
+        expect(viewer.getVisibilityState()).to.equal('visible');
+
+        viewer.dispose = sandbox.spy();
+        shadowDoc.close();
+        expect(viewer.getVisibilityState()).to.equal('inactive');
+        expect(viewer.dispose).to.be.calledOnce;
+      });
+    });
+  });
+
+
   describe('messaging', () => {
-    let timer;
     let doc1, doc2, doc3;
 
     beforeEach(() => {
-      timer = timerFor(win);
       doc1 = attach('https://example.org/doc1');
       doc2 = attach('https://example.org/doc2');
       doc3 = attach('https://example.org/doc3');
@@ -993,7 +1430,7 @@ describes.realWin('runtime multidoc', {
       viewer.onBroadcast(broadcastReceived);
       const onMessage = sandbox.stub();
       amp.onMessage(function(eventType, data) {
-        if (eventType == 'ignore' || eventType == 'documentLoaded') {
+        if (eventType == 'ignore') {
           return Promise.resolve();
         }
         return onMessage(eventType, data);
@@ -1004,8 +1441,6 @@ describes.realWin('runtime multidoc', {
     it('should broadcast to all but sender', () => {
       doc1.viewer.broadcast({test: 1});
       return doc1.viewer.sendMessageAwaitResponse('ignore', {}).then(() => {
-        return timer.promise(0);
-      }).then(() => {
         // Sender is not called.
         expect(doc1.broadcastReceived).to.not.be.called;
 
@@ -1026,8 +1461,6 @@ describes.realWin('runtime multidoc', {
       doc3.amp.close();
       doc1.viewer.broadcast({test: 1});
       return doc1.viewer.sendMessageAwaitResponse('ignore', {}).then(() => {
-        return timer.promise(0);
-      }).then(() => {
         // Sender is not called, closed is not called.
         expect(doc1.broadcastReceived).to.not.be.called;
         expect(doc3.broadcastReceived).to.not.be.called;
@@ -1042,8 +1475,6 @@ describes.realWin('runtime multidoc', {
       doc3.hostElement.parentNode.removeChild(doc3.hostElement);
       doc1.viewer.broadcast({test: 1});
       return doc1.viewer.sendMessageAwaitResponse('ignore', {}).then(() => {
-        return timer.promise(0);
-      }).then(() => {
         // Sender is not called, closed is not called.
         expect(doc1.broadcastReceived).to.not.be.called;
         expect(doc3.broadcastReceived).to.not.be.called;
@@ -1059,8 +1490,6 @@ describes.realWin('runtime multidoc', {
       doc1.onMessage.returns(Promise.resolve());
       return doc1.viewer.sendMessageAwaitResponse('test3', {test: 3}).then(
           () => {
-            return timer.promise(0);
-          }).then(() => {
             expect(doc1.onMessage).to.be.calledOnce;
             expect(doc1.onMessage.args[0][0]).to.equal('test3');
             expect(doc1.onMessage.args[0][1]).to.deep.equal({test: 3});

@@ -18,10 +18,14 @@ import {BaseElement} from '../../src/base-element';
 import {ElementStub, setLoadingCheckForTests} from '../../src/element-stub';
 import {LOADING_ELEMENTS_, Layout} from '../../src/layout';
 import {installResourcesServiceForDoc} from '../../src/service/resources-impl';
-import {vsyncFor} from '../../src/vsync';
-import * as sinon from 'sinon';
-
-import {getService, resetServiceForTesting} from '../../src/service';
+import {poll} from '../../testing/iframe';
+import {ResourceState} from '../../src/service/resource';
+import {resourcesForDoc} from '../../src/services';
+import {vsyncFor} from '../../src/services';
+import {
+  registerServiceBuilder,
+  resetServiceForTesting,
+} from '../../src/service';
 import {
   copyElementToChildWindow,
   createAmpElementProto,
@@ -40,6 +44,7 @@ import {
   getElementServiceForDoc,
   getElementServiceIfAvailableForDoc,
 } from '../../src/element-service';
+import * as lolex from 'lolex';
 
 
 describes.realWin('CustomElement register', {amp: 1}, env => {
@@ -51,6 +56,7 @@ describes.realWin('CustomElement register', {amp: 1}, env => {
   beforeEach(() => {
     win = env.win;
     setLoadingCheckForTests('amp-element1');
+    installResourcesServiceForDoc(window.document);
   });
 
   it('should go through stub/upgrade cycle', () => {
@@ -77,9 +83,15 @@ describes.realWin('CustomElement register', {amp: 1}, env => {
 });
 
 
-describe('CustomElement', () => {
+describes.realWin('CustomElement', {amp: true}, env => {
+  let win, doc;
+  let resources;
+  let resourcesMock;
+  let clock;
+  let testElementGetInsersectionElementLayoutBox;
+  let container;
+  let ElementClass, StubElementClass;
 
-  const resources = installResourcesServiceForDoc(window.document);
   let testElementCreatedCallback;
   let testElementPreconnectCallback;
   let testElementFirstAttachedCallback;
@@ -146,26 +158,22 @@ describe('CustomElement', () => {
     }
   }
 
-  const ElementClass = document.registerElement('amp-test', {
-    prototype: createAmpElementProto(window, 'amp-test', TestElement),
-  });
-
-  const StubElementClass = document.registerElement('amp-stub', {
-    prototype: createAmpElementProto(window, 'amp-stub', ElementStub),
-  });
-
-  let sandbox;
-  let resourcesMock;
-  let clock;
-  let testElementGetInsersectionElementLayoutBox;
-  let container;
-
   beforeEach(() => {
-    sandbox = sinon.sandbox.create();
+    win = env.win;
+    doc = win.document;
+    clock = lolex.install(win);
+    resources = resourcesForDoc(doc);
+    resources.isBuildOn_ = true;
     resourcesMock = sandbox.mock(resources);
-    clock = sandbox.useFakeTimers();
-    container = document.createElement('div');
-    document.body.appendChild(container);
+    container = doc.createElement('div');
+    doc.body.appendChild(container);
+
+    ElementClass = doc.registerElement('amp-test', {
+      prototype: createAmpElementProto(win, 'amp-test', TestElement),
+    });
+    StubElementClass = doc.registerElement('amp-stub', {
+      prototype: createAmpElementProto(win, 'amp-stub', ElementStub),
+    });
 
     testElementCreatedCallback = sandbox.spy();
     testElementPreconnectCallback = sandbox.spy();
@@ -183,12 +191,7 @@ describe('CustomElement', () => {
 
   afterEach(() => {
     resourcesMock.verify();
-    sandbox.restore();
-    if (container.parentNode) {
-      container.parentNode.removeChild(container);
-    }
   });
-
 
   it('should initialize ampdoc and resources on attach only', () => {
     const element = new ElementClass();
@@ -199,7 +202,6 @@ describe('CustomElement', () => {
 
     // Resources available after attachment.
     container.appendChild(element);
-    element.attachedCallback();
     expect(element.ampdoc_).to.be.ok;
     expect(element.getAmpDoc()).to.be.ok;
     expect(element.resources_).to.be.ok;
@@ -217,15 +219,14 @@ describe('CustomElement', () => {
     expect(element.readyState).to.equal('loading');
     expect(element.everAttached).to.equal(false);
     expect(element.layout_).to.equal(Layout.NODISPLAY);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
 
     container.appendChild(element);
-    element.attachedCallback();
     expect(element).to.have.class('i-amphtml-element');
     expect(element).to.have.class('i-amphtml-notbuilt');
     expect(element).to.have.class('amp-notbuilt');
     expect(element.everAttached).to.equal(true);
-    expect(testElementCreatedCallback.callCount).to.equal(1);
+    expect(testElementCreatedCallback).to.be.calledOnce;
     expect(element.isUpgraded()).to.equal(true);
     expect(build.calledOnce);
 
@@ -243,15 +244,14 @@ describe('CustomElement', () => {
     expect(element.readyState).to.equal('loading');
     expect(element.everAttached).to.equal(false);
     expect(element.layout_).to.equal(Layout.NODISPLAY);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
 
     container.appendChild(element);
-    element.attachedCallback();
     expect(element).to.have.class('i-amphtml-element');
     expect(element).to.have.class('i-amphtml-notbuilt');
     expect(element).to.have.class('amp-notbuilt');
     expect(element.everAttached).to.equal(true);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
     expect(element.isUpgraded()).to.equal(false);
     expect(build.calledOnce);
   });
@@ -265,7 +265,6 @@ describe('CustomElement', () => {
     expect(element).to.not.have.class('amp-notbuilt');
 
     container.appendChild(element);
-    element.attachedCallback();
 
     expect(element).to.have.class('i-amphtml-element');
     expect(element).to.have.class('i-amphtml-notbuilt');
@@ -281,19 +280,54 @@ describe('CustomElement', () => {
     expect(element).to.not.have.class('amp-notbuilt');
   });
 
+  it('Element - should reset on 2nd attachedCallback when requested', () => {
+    clock.tick(1);
+    const element = new ElementClass();
+    sandbox.stub(element, 'build');
+    container.appendChild(element);
+
+    sandbox.stub(element, 'reconstructWhenReparented', () => true);
+    element.layoutCount_ = 10;
+    element.isFirstLayoutCompleted_ = true;
+    element.signals().signal('render-start');
+    element.signals().signal('load-end');
+    element.attachedCallback();
+    expect(element.layoutCount_).to.equal(0);
+    expect(element.isFirstLayoutCompleted_).to.be.false;
+    expect(element.signals().get('render-start')).to.be.null;
+    expect(element.signals().get('load-end')).to.be.null;
+  });
+
+  it('Element - should NOT reset on 2nd attachedCallback w/o request', () => {
+    clock.tick(1);
+    const element = new ElementClass();
+    sandbox.stub(element, 'build');
+    container.appendChild(element);
+
+    sandbox.stub(element, 'reconstructWhenReparented', () => false);
+    element.layoutCount_ = 10;
+    element.isFirstLayoutCompleted_ = true;
+    element.signals().signal('render-start');
+    expect(element.signals().get('render-start')).to.be.ok;
+    element.signals().signal('load-end');
+    element.attachedCallback();
+    expect(element.layoutCount_).to.equal(10);
+    expect(element.isFirstLayoutCompleted_).to.be.true;
+    expect(element.signals().get('render-start')).to.be.ok;
+    expect(element.signals().get('load-end')).to.be.ok;
+  });
+
   it('Element - getIntersectionChangeEntry', () => {
     const element = new ElementClass();
     container.appendChild(element);
-    element.attachedCallback();
     element.updateLayoutBox({top: 0, left: 0, width: 111, height: 51});
     element.getIntersectionChangeEntry();
-    expect(testElementGetInsersectionElementLayoutBox.callCount).to.equal(1);
+    expect(testElementGetInsersectionElementLayoutBox).to.be.calledOnce;
   });
 
   it('Element - updateLayoutBox', () => {
     const element = new ElementClass();
     container.appendChild(element);
-    element.attachedCallback();
     expect(element.layoutWidth_).to.equal(-1);
     expect(element.implementation_.layoutWidth_).to.equal(-1);
 
@@ -302,15 +336,27 @@ describe('CustomElement', () => {
     expect(element.implementation_.layoutWidth_).to.equal(111);
   });
 
+  it('should tolerate erros in onLayoutMeasure', () => {
+    const element = new ElementClass();
+    sandbox.stub(element.implementation_, 'onLayoutMeasure', () => {
+      throw new Error('intentional');
+    });
+    const errorStub = sandbox.stub(element, 'dispatchCustomEventForTesting');
+    container.appendChild(element);
+    element.updateLayoutBox({top: 0, left: 0, width: 111, height: 51});
+    expect(element.layoutWidth_).to.equal(111);
+    expect(element.implementation_.layoutWidth_).to.equal(111);
+    expect(errorStub).to.be.calledWith('amp:error', 'intentional');
+  });
+
   it('StubElement - upgrade after attached', () => {
     const element = new StubElementClass();
     expect(element.isUpgraded()).to.equal(false);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
 
     element.setAttribute('layout', 'fill');
     element.updateLayoutBox({top: 0, left: 0, width: 111, height: 51});
     container.appendChild(element);
-    element.attachedCallback();
     resourcesMock.expects('upgraded').withExactArgs(element).once();
 
     element.upgrade(TestElement);
@@ -319,15 +365,15 @@ describe('CustomElement', () => {
     expect(element.implementation_).to.be.instanceOf(TestElement);
     expect(element.implementation_.layout_).to.equal(Layout.FILL);
     expect(element.implementation_.layoutWidth_).to.equal(111);
-    expect(testElementCreatedCallback.callCount).to.equal(1);
-    expect(testElementFirstAttachedCallback.callCount).to.equal(1);
+    expect(testElementCreatedCallback).to.be.calledOnce;
+    expect(testElementFirstAttachedCallback).to.be.calledOnce;
     expect(element.isBuilt()).to.equal(false);
   });
 
   it('StubElement - upgrade before attached', () => {
     const element = new StubElementClass();
     expect(element.isUpgraded()).to.equal(false);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
 
     element.setAttribute('layout', 'fill');
     element.updateLayoutBox({top: 0, left: 0, width: 111, height: 51});
@@ -337,8 +383,8 @@ describe('CustomElement', () => {
 
     expect(element.isUpgraded()).to.equal(false);
     expect(element.implementation_).to.be.instanceOf(TestElement);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
-    expect(testElementFirstAttachedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
+    expect(testElementFirstAttachedCallback).to.have.not.been.called;
     expect(element.isBuilt()).to.equal(false);
   });
 
@@ -361,7 +407,6 @@ describe('CustomElement', () => {
     element.implementation_.upgradeCallback = () => newImpl;
 
     container.appendChild(element);
-    element.attachedCallback();
     expect(element.isUpgraded()).to.equal(true);
     expect(element.implementation_).to.equal(newImpl);
   });
@@ -375,7 +420,6 @@ describe('CustomElement', () => {
     oldImpl.upgradeCallback = () => promise;
 
     container.appendChild(element);
-    element.attachedCallback();
     expect(element.implementation_).to.equal(oldImpl);
     expect(element.isUpgraded()).to.equal(false);
     expect(element.upgradeState_).to.equal(/* UPGRADE_IN_PROGRESS */ 4);
@@ -383,6 +427,26 @@ describe('CustomElement', () => {
       // Skip a microtask.
     }).then(() => {
       expect(element.implementation_).to.equal(newImpl);
+      expect(element.isUpgraded()).to.equal(true);
+      expect(element.upgradeState_).to.equal(/* UPGRADED */ 2);
+    });
+  });
+
+  it('Element - re-upgrade to new promised null', () => {
+    const element = new ElementClass();
+    expect(element.isUpgraded()).to.equal(false);
+    const oldImpl = element.implementation_;
+    const promise = Promise.resolve(null);
+    oldImpl.upgradeCallback = () => promise;
+
+    container.appendChild(element);
+    expect(element.implementation_).to.equal(oldImpl);
+    expect(element.isUpgraded()).to.equal(false);
+    expect(element.upgradeState_).to.equal(/* UPGRADE_IN_PROGRESS */ 4);
+    return promise.then(() => {
+      // Skip a microtask.
+    }).then(() => {
+      expect(element.implementation_).to.equal(oldImpl);
       expect(element.isUpgraded()).to.equal(true);
       expect(element.upgradeState_).to.equal(/* UPGRADED */ 2);
     });
@@ -396,7 +460,6 @@ describe('CustomElement', () => {
     oldImpl.upgradeCallback = () => promise;
 
     container.appendChild(element);
-    element.attachedCallback();
     expect(element.implementation_).to.equal(oldImpl);
     expect(element.isUpgraded()).to.equal(false);
     expect(element.upgradeState_).to.equal(/* UPGRADE_IN_PROGRESS */ 4);
@@ -419,13 +482,12 @@ describe('CustomElement', () => {
     oldImpl.upgradeCallback = () => promise;
 
     container.appendChild(element);
-    element.attachedCallback();
     expect(element.implementation_).to.equal(oldImpl);
     expect(element.isUpgraded()).to.equal(false);
     expect(element.upgradeState_).to.equal(/* UPGRADE_IN_PROGRESS */ 4);
 
     oldImpl.upgradeCallback = () => newImpl2;
-    element.tryUpgrade_();
+    container.appendChild(element);
     expect(element.implementation_).to.equal(oldImpl);
     expect(element.isUpgraded()).to.equal(false);
     expect(element.upgradeState_).to.equal(/* UPGRADE_IN_PROGRESS */ 4);
@@ -441,13 +503,13 @@ describe('CustomElement', () => {
   it('StubElement - re-upgrade', () => {
     const element = new StubElementClass();
     expect(element.isUpgraded()).to.equal(false);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
     resourcesMock.expects('upgraded').withExactArgs(element).never();
 
     element.upgrade(TestElementWithReUpgrade);
 
     expect(element.isUpgraded()).to.equal(false);
-    expect(testElementCreatedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
   });
 
 
@@ -460,85 +522,81 @@ describe('CustomElement', () => {
 
   it('Element - build allowed', () => {
     const element = new ElementClass();
-    element.tryUpgrade_();
 
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementBuildCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.have.not.been.called;
     expect(element.signals().get('built')).to.not.be.ok;
 
     clock.tick(1);
-    element.build();
+    container.appendChild(element);
+
     expect(element.isBuilt()).to.equal(true);
     expect(element).to.not.have.class('i-amphtml-notbuilt');
     expect(element).to.not.have.class('amp-notbuilt');
-    expect(testElementBuildCallback.callCount).to.equal(1);
-    expect(element.signals().get('built')).to.equal(1);
+    expect(testElementBuildCallback).to.be.calledOnce;
+    expect(element.signals().get('built')).to.be.ok;
     return element.whenBuilt();  // Should eventually resolve.
   });
 
   it('should anticipate build errors', () => {
     const element = new ElementClass();
-    element.tryUpgrade_();
     sandbox.stub(element.implementation_, 'buildCallback', () => {
       throw new Error('intentional');
     });
-    expect(() => {
-      element.build();
-    }).to.throw(/intentional/);
+    container.appendChild(element);
     expect(element.isBuilt()).to.be.false;
-    expect(element).to.not.have.class('i-amphtml-notbuilt');
-    expect(element).to.not.have.class('amp-notbuilt');
+    expect(element).to.have.class('i-amphtml-notbuilt');
+    expect(element).to.have.class('amp-notbuilt');
     return expect(element.whenBuilt())
         .to.be.eventually.rejectedWith(/intentional/);
   });
 
   it('Element - build creates a placeholder if one does not exist' , () => {
     const element = new ElementClass();
-    element.tryUpgrade_();
-    expect(testElementCreatePlaceholderCallback.callCount).to.equal(0);
+    expect(testElementCreatePlaceholderCallback).to.have.not.been.called;
 
-    element.build();
+    container.appendChild(element);
+
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementCreatePlaceholderCallback.callCount).to.equal(1);
+    expect(testElementCreatePlaceholderCallback).to.be.calledOnce;
   });
 
   it('Element - build does not create a placeholder when one exists' , () => {
     const element = new ElementClass();
-    element.tryUpgrade_();
-    const placeholder = document.createElement('div');
+    const placeholder = doc.createElement('div');
     placeholder.setAttribute('placeholder', '');
     element.appendChild(placeholder);
-    expect(testElementCreatePlaceholderCallback.callCount).to.equal(0);
+    expect(testElementCreatePlaceholderCallback).to.have.not.been.called;
 
-    element.build();
+    container.appendChild(element);
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementCreatePlaceholderCallback.callCount).to.equal(0);
+    expect(testElementCreatePlaceholderCallback).to.have.not.been.called;
   });
 
   it('Element - buildCallback cannot be called twice', () => {
     const element = new ElementClass();
-    element.tryUpgrade_();
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementBuildCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.have.not.been.called;
 
-    element.build();
+    container.appendChild(element);
+
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementBuildCallback.callCount).to.equal(1);
-    expect(testElementPreconnectCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.be.calledOnce;
+    expect(testElementPreconnectCallback).to.have.not.been.called;
 
     // Call again.
     element.build();
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementBuildCallback.callCount).to.equal(1);
-    expect(testElementPreconnectCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.be.calledOnce;
+    expect(testElementPreconnectCallback).to.have.not.been.called;
     clock.tick(1);
-    expect(testElementPreconnectCallback.callCount).to.equal(1);
+    expect(testElementPreconnectCallback).to.be.calledOnce;
   });
 
   it('Element - build NOT allowed when in template', () => {
     const element = new ElementClass();
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementBuildCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.have.not.been.called;
 
     element.isInTemplate_ = true;
     expect(() => {
@@ -546,62 +604,60 @@ describe('CustomElement', () => {
     }).to.throw(/Must never be called in template/);
 
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementBuildCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.have.not.been.called;
   });
 
   it('StubElement - build never allowed', () => {
     const element = new StubElementClass();
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementBuildCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.have.not.been.called;
 
     expect(() => {
       element.build();
     }).to.throw(/Cannot build unupgraded element/);
 
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementBuildCallback.callCount).to.equal(0);
+    expect(testElementBuildCallback).to.have.not.been.called;
   });
 
   it('Element - createPlaceholder', () => {
     const element = new ElementClass();
     element.createPlaceholder();
-    expect(testElementCreatePlaceholderCallback.callCount).to.equal(1);
+    expect(testElementCreatePlaceholderCallback).to.be.calledOnce;
   });
 
   it('Element - attachedCallback', () => {
     const element = new ElementClass();
     element.setAttribute('layout', 'fill');
-    expect(testElementFirstAttachedCallback.callCount).to.equal(0);
+    expect(testElementFirstAttachedCallback).to.have.not.been.called;
     expect(element.everAttached).to.equal(false);
     expect(element.layout_).to.equal(Layout.NODISPLAY);
 
     resourcesMock.expects('add').withExactArgs(element).atLeast(1);
+    resourcesMock.expects('upgraded').withExactArgs(element).atLeast(1);
     container.appendChild(element);
-    element.attachedCallback();
 
     expect(element.everAttached).to.equal(true);
     expect(element.layout_).to.equal(Layout.FILL);
     expect(element.implementation_.layout_).to.equal(Layout.FILL);
-    expect(testElementFirstAttachedCallback.callCount).to.equal(1);
+    expect(testElementFirstAttachedCallback).to.be.calledOnce;
   });
 
   it('StubElement - attachedCallback', () => {
     const element = new StubElementClass();
     element.setAttribute('layout', 'fill');
-    expect(testElementFirstAttachedCallback.callCount).to.equal(0);
+    expect(testElementFirstAttachedCallback).to.have.not.been.called;
     expect(element.everAttached).to.equal(false);
     expect(element.layout_).to.equal(Layout.NODISPLAY);
 
     resourcesMock.expects('add').withExactArgs(element).atLeast(1);
     container.appendChild(element);
-    element.attachedCallback();
 
     expect(element.everAttached).to.equal(true);
     expect(element.layout_).to.equal(Layout.FILL);
-    expect(element.implementation_.layout_).to.equal(Layout.FILL);
     // Not upgraded yet!
-    expect(testElementCreatedCallback.callCount).to.equal(0);
-    expect(testElementFirstAttachedCallback.callCount).to.equal(0);
+    expect(testElementCreatedCallback).to.have.not.been.called;
+    expect(testElementFirstAttachedCallback).to.have.not.been.called;
     expect(element).to.have.class('amp-unresolved');
     expect(element).to.have.class('i-amphtml-unresolved');
 
@@ -612,8 +668,8 @@ describe('CustomElement', () => {
     expect(element.layout_).to.equal(Layout.FILL);
     expect(element.implementation_.layout_).to.equal(Layout.FILL);
     // Now it's called.
-    expect(testElementCreatedCallback.callCount).to.equal(1);
-    expect(testElementFirstAttachedCallback.callCount).to.equal(1);
+    expect(testElementCreatedCallback).to.be.calledOnce;
+    expect(testElementFirstAttachedCallback).to.be.calledOnce;
     expect(element).to.not.have.class('amp-unresolved');
     expect(element).to.not.have.class('i-amphtml-unresolved');
   });
@@ -621,13 +677,13 @@ describe('CustomElement', () => {
   it('Element - detachedCallback', () => {
     const element = new ElementClass();
     element.setAttribute('layout', 'fill');
-    expect(testElementFirstAttachedCallback.callCount).to.equal(0);
+    expect(testElementFirstAttachedCallback).to.have.not.been.called;
     expect(element.everAttached).to.equal(false);
     expect(element.layout_).to.equal(Layout.NODISPLAY);
 
     resourcesMock.expects('add').withExactArgs(element).atLeast(1);
+    resourcesMock.expects('upgraded').withExactArgs(element).atLeast(1);
     container.appendChild(element);
-    element.attachedCallback();
 
     resourcesMock.expects('remove').withExactArgs(element).once();
     element.detachedCallback();
@@ -635,28 +691,27 @@ describe('CustomElement', () => {
     expect(element.everAttached).to.equal(true);
     expect(element.layout_).to.equal(Layout.FILL);
     expect(element.implementation_.layout_).to.equal(Layout.FILL);
-    expect(testElementFirstAttachedCallback.callCount).to.equal(1);
+    expect(testElementFirstAttachedCallback).to.be.calledOnce;
   });
 
 
   it('Element - layoutCallback before build', () => {
     const element = new ElementClass();
     element.setAttribute('layout', 'fill');
-    element.tryUpgrade_();
-    expect(testElementLayoutCallback.callCount).to.equal(0);
-
+    expect(testElementLayoutCallback).to.have.not.been.called;
     expect(element.isBuilt()).to.equal(false);
+
     expect(() => {
       element.layoutCallback();
     }).to.throw(/Must be built to receive viewport events/);
 
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
   });
 
   it('StubElement - layoutCallback before build or upgrade', () => {
     const element = new StubElementClass();
     element.setAttribute('layout', 'fill');
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
 
     expect(element.isUpgraded()).to.equal(false);
     expect(element.isBuilt()).to.equal(false);
@@ -673,50 +728,29 @@ describe('CustomElement', () => {
       element.layoutCallback();
     }).to.throw(/Must be built to receive viewport events/);
 
-    expect(testElementLayoutCallback.callCount).to.equal(0);
-  });
-
-  it('StubElement - layoutCallback after upgrade but before build', () => {
-    const element = new StubElementClass();
-    element.setAttribute('layout', 'fill');
-    expect(testElementLayoutCallback.callCount).to.equal(0);
-    expect(element.isUpgraded()).to.equal(false);
-    expect(element.isBuilt()).to.equal(false);
-
-    resourcesMock.expects('upgraded').withExactArgs(element).once();
-    container.appendChild(element);
-    element.attachedCallback();
-    element.upgrade(TestElement);
-
-    expect(element.isUpgraded()).to.equal(true);
-    expect(element.isBuilt()).to.equal(false);
-    expect(() => {
-      element.layoutCallback();
-    }).to.throw(/Must be built to receive viewport events/);
-
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
   });
 
   it('Element - layoutCallback', () => {
     const element = new ElementClass();
     element.setAttribute('layout', 'fill');
-    element.tryUpgrade_();
+    container.appendChild(element);
     element.build();
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
     clock.tick(1);
-    expect(testElementPreconnectCallback.callCount).to.equal(1);
+    expect(testElementPreconnectCallback).to.be.calledOnce;
     expect(testElementPreconnectCallback.getCall(0).args[0]).to.be.false;
 
     const p = element.layoutCallback();
-    expect(testElementLayoutCallback.callCount).to.equal(1);
-    expect(testElementPreconnectCallback.callCount).to.equal(2);
+    expect(testElementLayoutCallback).to.be.calledOnce;
+    expect(testElementPreconnectCallback).to.have.callCount(2);
     expect(testElementPreconnectCallback.getCall(1).args[0]).to.be.true;
-    expect(element.signals().get('load-start')).to.equal(1);
+    expect(element.signals().get('load-start')).to.be.ok;
     expect(element.signals().get('load-end')).to.be.null;
     return p.then(() => {
       expect(element.readyState).to.equal('complete');
-      expect(element.signals().get('load-end')).to.equal(1);
+      expect(element.signals().get('load-end')).to.be.ok;
     });
   });
 
@@ -724,21 +758,20 @@ describe('CustomElement', () => {
       () => {
         const element = new ElementClass();
         element.setAttribute('layout', 'fill');
-        element.tryUpgrade_();
-        element.build();
+        container.appendChild(element);
 
         const p = element.layoutCallback();
-        expect(testElementLayoutCallback.callCount).to.equal(1);
-        expect(testElementFirstLayoutCompleted.callCount).to.equal(0);
+        expect(testElementLayoutCallback).to.be.calledOnce;
+        expect(testElementFirstLayoutCompleted).to.have.not.been.called;
         return p.then(() => {
-          expect(testElementFirstLayoutCompleted.callCount).to.equal(1);
+          expect(testElementFirstLayoutCompleted).to.be.calledOnce;
 
           // But not second time.
           const p2 = element.layoutCallback();
-          expect(testElementLayoutCallback.callCount).to.equal(2);
-          expect(testElementFirstLayoutCompleted.callCount).to.equal(1);
+          expect(testElementLayoutCallback).to.have.callCount(2);
+          expect(testElementFirstLayoutCompleted).to.be.calledOnce;
           return p2.then(() => {
-            expect(testElementFirstLayoutCompleted.callCount).to.equal(1);
+            expect(testElementFirstLayoutCompleted).to.be.calledOnce;
           });
         });
       });
@@ -746,10 +779,10 @@ describe('CustomElement', () => {
   it('Element - layoutCallback is NOT allowed in template', () => {
     const element = new ElementClass();
     element.setAttribute('layout', 'fill');
-    element.tryUpgrade_();
+    container.appendChild(element);
     element.build();
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
 
     element.isInTemplate_ = true;
     expect(() => {
@@ -765,7 +798,7 @@ describe('CustomElement', () => {
     expect(() => element.build()).to.throw(/Cannot build unupgraded element/);
     expect(element.isUpgraded()).to.equal(false);
     expect(element.isBuilt()).to.equal(false);
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
   });
 
   it('StubElement - layoutCallback after attached', () => {
@@ -778,10 +811,10 @@ describe('CustomElement', () => {
     element.build();
     expect(element.isUpgraded()).to.equal(true);
     expect(element.isBuilt()).to.equal(true);
-    expect(testElementLayoutCallback.callCount).to.equal(0);
+    expect(testElementLayoutCallback).to.have.not.been.called;
 
     const p = element.layoutCallback();
-    expect(testElementLayoutCallback.callCount).to.equal(1);
+    expect(testElementLayoutCallback).to.be.calledOnce;
     return p.then(() => {
       expect(element.readyState).to.equal('complete');
     });
@@ -798,26 +831,25 @@ describe('CustomElement', () => {
     element.enqueAction(inv);
     expect(element.actionQueue_.length).to.equal(1);
     expect(element.actionQueue_[0]).to.equal(inv);
-    expect(handler.callCount).to.equal(0);
+    expect(handler).to.have.not.been.called;
   });
 
   it('should execute action immediately after built', () => {
     const element = new ElementClass();
     const handler = sandbox.spy();
     element.implementation_.executeAction = handler;
-    element.tryUpgrade_();
+    container.appendChild(element);
     element.build();
 
     const inv = {};
     element.enqueAction(inv);
-    expect(handler.callCount).to.equal(1);
+    expect(handler).to.be.calledOnce;
     expect(handler.getCall(0).args[0]).to.equal(inv);
     expect(handler.getCall(0).args[1]).to.equal(false);
   });
 
   it('should dequeue all actions after build', () => {
     const element = new ElementClass();
-    element.tryUpgrade_();
     const handler = sandbox.spy();
     element.implementation_.executeAction = handler;
 
@@ -828,11 +860,11 @@ describe('CustomElement', () => {
     expect(element.actionQueue_.length).to.equal(2);
     expect(element.actionQueue_[0]).to.equal(inv1);
     expect(element.actionQueue_[1]).to.equal(inv2);
-    expect(handler.callCount).to.equal(0);
+    expect(handler).to.have.not.been.called;
 
-    element.build();
+    container.appendChild(element);
     clock.tick(10);
-    expect(handler.callCount).to.equal(2);
+    expect(handler).to.have.callCount(2);
     expect(handler.getCall(0).args[0]).to.equal(inv1);
     expect(handler.getCall(0).args[1]).to.equal(true);
     expect(handler.getCall(1).args[0]).to.equal(inv2);
@@ -880,29 +912,27 @@ describe('CustomElement', () => {
 
   it('should apply heights condition', () => {
     const element1 = new ElementClass();
-    element1.sizerElement_ = document.createElement('div');
+    element1.sizerElement_ = doc.createElement('div');
     element1.setAttribute('layout', 'responsive');
     element1.setAttribute('width', '200px');
     element1.setAttribute('height', '200px');
     element1.setAttribute('heights', '(min-width: 1px) 99%, 1%');
     container.appendChild(element1);
-    element1.attachedCallback();
     element1.applySizesAndMediaQuery();
     expect(element1.sizerElement_.style.paddingTop).to.equal('99%');
 
     const element2 = new ElementClass();
-    element2.sizerElement_ = document.createElement('div');
+    element2.sizerElement_ = doc.createElement('div');
     element2.setAttribute('layout', 'responsive');
     element2.setAttribute('width', '200px');
     element2.setAttribute('height', '200px');
     element2.setAttribute('heights', '(min-width: 1111111px) 99%, 1%');
     container.appendChild(element2);
-    element2.attachedCallback();
     element2.applySizesAndMediaQuery();
     expect(element2.sizerElement_.style.paddingTop).to.equal('1%');
   });
 
-  it('should rediscover sizer to apply heights', () => {
+  it('should rediscover sizer to apply heights in SSR', () => {
     const element1 = new ElementClass();
     element1.setAttribute('i-amphtml-layout', 'responsive');
     element1.setAttribute('layout', 'responsive');
@@ -911,16 +941,15 @@ describe('CustomElement', () => {
     element1.setAttribute('heights', '(min-width: 1px) 99%, 1%');
     container.appendChild(element1);
 
-    const sizer = document.createElement('i-amphtml-sizer');
-    element1.appendChild(sizer);
+    const sizer = doc.createElement('i-amphtml-sizer');
     expect(element1.sizerElement_).to.be.undefined;
-    element1.attachedCallback();
+    element1.appendChild(sizer);
     element1.applySizesAndMediaQuery();
     expect(element1.sizerElement_).to.equal(sizer);
     expect(sizer.style.paddingTop).to.equal('99%');
   });
 
-  it('should NOT rediscover sizer after reset', () => {
+  it('should NOT rediscover sizer after reset in SSR', () => {
     const element1 = new ElementClass();
     element1.setAttribute('i-amphtml-layout', 'responsive');
     element1.setAttribute('layout', 'responsive');
@@ -929,13 +958,23 @@ describe('CustomElement', () => {
     element1.setAttribute('heights', '(min-width: 1px) 99%, 1%');
     container.appendChild(element1);
 
-    const sizer = document.createElement('i-amphtml-sizer');
+    const sizer = doc.createElement('i-amphtml-sizer');
     element1.appendChild(sizer);
-    element1.attachedCallback();
     element1.sizerElement_ = null;
     element1.applySizesAndMediaQuery();
     expect(element1.sizerElement_).to.be.null;
     expect(sizer.style.paddingTop).to.equal('');
+  });
+
+  it('should reapply layout=nodisplay in SSR', () => {
+    const element1 = new ElementClass();
+    element1.setAttribute('i-amphtml-layout', 'nodisplay');
+    element1.setAttribute('layout', 'nodisplay');
+    container.appendChild(element1);
+    // TODO(dvoytenko, #9353): cleanup once `toggleLayoutDisplay` API has been
+    // fully migrated.
+    expect(element1.style.display).to.equal('none');
+    expect(element1).to.have.class('i-amphtml-display');
   });
 
   it('should change size without sizer', () => {
@@ -993,7 +1032,7 @@ describe('CustomElement', () => {
 
   it('should change size with sizer', () => {
     const element = new ElementClass();
-    const sizer = document.createElement('div');
+    const sizer = doc.createElement('div');
     element.sizerElement_ = sizer;
     element.changeSize(111, 222, {top: 1, right: 2, bottom: 3, left: 4});
     expect(parseInt(sizer.style.paddingTop, 10)).to.equal(0);
@@ -1028,15 +1067,24 @@ describe('CustomElement', () => {
     expect(element.style.width).to.equal('0px');
   });
 
+  it('should remove i-amphtml-layout-awaiting-size class when ' +
+      'size changed', () => {
+    const element = new StubElementClass();
+    expect(element.isUpgraded()).to.equal(false);
+    element.classList.add('i-amphtml-layout-awaiting-size');
+
+    expect(element).to.have.class('i-amphtml-layout-awaiting-size');
+    element.changeSize(100, 100);
+    expect(element).not.to.have.class('i-amphtml-layout-awaiting-size');
+  });
 
   describe('unlayoutCallback', () => {
 
     it('should unlayout built element and reset layoutCount', () => {
       const element = new ElementClass();
-      element.tryUpgrade_();
       // Non-built element doesn't receive unlayoutCallback.
       element.unlayoutCallback();
-      expect(testElementUnlayoutCallback.callCount).to.equal(0);
+      expect(testElementUnlayoutCallback).to.have.not.been.called;
 
       element.implementation_.layoutCallback = () => {
         testElementLayoutCallback();
@@ -1048,17 +1096,17 @@ describe('CustomElement', () => {
         testElementUnlayoutCallback();
         return true;
       };
+
       // Built element receives unlayoutCallback.
-      element.build();
+      container.appendChild(element);
       element.unlayoutCallback();
-      expect(testElementUnlayoutCallback.callCount).to.equal(1);
+      expect(testElementUnlayoutCallback).to.be.calledOnce;
       expect(element.layoutCount_).to.equal(0);
     });
 
     it('should not reset layoutCount if relayout not requested', () => {
       const element = new ElementClass();
-      element.tryUpgrade_();
-      element.build();
+      container.appendChild(element);
       element.implementation_.layoutCallback = () => {
         testElementLayoutCallback();
         element.layoutCount_++;
@@ -1071,7 +1119,7 @@ describe('CustomElement', () => {
       };
       element.layoutCallback();
       element.unlayoutCallback();
-      expect(testElementUnlayoutCallback.callCount).to.equal(1);
+      expect(testElementUnlayoutCallback).to.be.calledOnce;
       expect(element.layoutCount_).to.equal(1);
     });
 
@@ -1080,23 +1128,22 @@ describe('CustomElement', () => {
 
       // Unupgraded document doesn't receive unlayoutCallback.
       element.unlayoutCallback();
-      expect(testElementUnlayoutCallback.callCount).to.equal(0);
+      expect(testElementUnlayoutCallback).to.have.not.been.called;
     });
   });
 
   describe('pauseCallback', () => {
     it('Element', () => {
       const element = new ElementClass();
-      element.tryUpgrade_();
 
       // Non-built element doesn't receive pauseCallback.
       element.pauseCallback();
-      expect(testElementPauseCallback.callCount).to.equal(0);
+      expect(testElementPauseCallback).to.have.not.been.called;
 
       // Built element receives pauseCallback.
-      element.build();
+      container.appendChild(element);
       element.pauseCallback();
-      expect(testElementPauseCallback.callCount).to.equal(1);
+      expect(testElementPauseCallback).to.be.calledOnce;
     });
 
     it('StubElement', () => {
@@ -1104,23 +1151,22 @@ describe('CustomElement', () => {
 
       // Unupgraded document doesn't receive pauseCallback.
       element.pauseCallback();
-      expect(testElementPauseCallback.callCount).to.equal(0);
+      expect(testElementPauseCallback).to.have.not.been.called;
     });
   });
 
   describe('resumeCallback', () => {
     it('Element', () => {
       const element = new ElementClass();
-      element.tryUpgrade_();
 
       // Non-built element doesn't receive resumeCallback.
       element.resumeCallback();
-      expect(testElementResumeCallback.callCount).to.equal(0);
+      expect(testElementResumeCallback).to.have.not.been.called;
 
       // Built element receives resumeCallback.
-      element.build();
+      container.appendChild(element);
       element.resumeCallback();
-      expect(testElementResumeCallback.callCount).to.equal(1);
+      expect(testElementResumeCallback).to.be.calledOnce;
     });
 
     it('StubElement', () => {
@@ -1128,7 +1174,7 @@ describe('CustomElement', () => {
 
       // Unupgraded document doesn't receive resumeCallback.
       element.resumeCallback();
-      expect(testElementResumeCallback.callCount).to.equal(0);
+      expect(testElementResumeCallback).to.have.not.been.called;
     });
   });
 
@@ -1136,24 +1182,24 @@ describe('CustomElement', () => {
     it('Element should allow, but not delegate before build', () => {
       const element = new ElementClass();
       element.setAttribute('layout', 'fill');
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
 
       expect(element.isBuilt()).to.equal(false);
       element.viewportCallback(true);
       expect(element.isInViewport_).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
     });
 
     it('StubElement - should not delegate before build or upgrade', () => {
       const element = new StubElementClass();
       element.setAttribute('layout', 'fill');
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
 
       expect(element.isUpgraded()).to.equal(false);
       expect(element.isBuilt()).to.equal(false);
       element.viewportCallback(true);
       expect(element.isInViewport_).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
 
       resourcesMock.expects('upgraded').withExactArgs(element).never();
       element.upgrade(TestElement);
@@ -1162,37 +1208,35 @@ describe('CustomElement', () => {
       expect(element.isBuilt()).to.equal(false);
       element.viewportCallback(false);
       expect(element.isInViewport_).to.equal(false);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
     });
 
     it('Element - should be called once built', () => {
       const element = new ElementClass();
       element.setAttribute('layout', 'fill');
-      element.tryUpgrade_();
-      element.build();
+      container.appendChild(element);
       expect(element.isBuilt()).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
 
       element.viewportCallback(true);
       expect(element.implementation_.inViewport_).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(1);
+      expect(testElementViewportCallback).to.be.calledOnce;
     });
 
     it('StubElement - should be called once upgraded', () => {
       const element = new StubElementClass();
       element.setAttribute('layout', 'fill');
-      resourcesMock.expects('upgraded').withExactArgs(element).once();
       container.appendChild(element);
-      element.attachedCallback();
-      element.upgrade(TestElement);
-      element.build();
-      expect(element.isUpgraded()).to.equal(true);
-      expect(element.isBuilt()).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(element.isUpgraded()).to.equal(false);
+      expect(element.isBuilt()).to.equal(false);
 
       element.viewportCallback(true);
+      expect(element.implementation_.inViewport_).to.equal(false);
+      expect(testElementViewportCallback).to.not.have.been.called;
+
+      element.upgrade(TestElement);
       expect(element.implementation_.inViewport_).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(1);
+      expect(testElementViewportCallback).to.be.calledOnce;
     });
 
     it('StubElement - should not upgrade before attach', () => {
@@ -1203,46 +1247,28 @@ describe('CustomElement', () => {
       expect(element.isUpgraded()).to.equal(false);
       expect(element.isBuilt()).to.equal(false);
       expect(element.implementation_).to.be.instanceOf(TestElement);
-      expect(testElementViewportCallback.callCount).to.equal(0);
-    });
-
-    it('StubElement - should be called once upgraded, attached', () => {
-      const element = new StubElementClass();
-      element.setAttribute('layout', 'fill');
-      element.everAttached = true;
-      element.resources_ = resources;
-      resourcesMock.expects('upgraded').withExactArgs(element).once();
-      element.upgrade(TestElement);
-      element.build();
-      expect(element.isUpgraded()).to.equal(true);
-      expect(element.isBuilt()).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
-
-      element.viewportCallback(true);
-      expect(element.implementation_.inViewport_).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(1);
+      expect(testElementViewportCallback).to.have.not.been.called;
     });
 
     it('Element - should be called on built if in viewport', () => {
       const element = new ElementClass();
       element.setAttribute('layout', 'fill');
-      element.tryUpgrade_();
       element.viewportCallback(true);
       expect(element.isInViewport_).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
 
-      element.build();
-      expect(element.isBuilt()).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(1);
+      container.appendChild(element);
+      expect(element.isInViewport_).to.equal(true);
+      expect(testElementViewportCallback).to.be.calledOnce;
     });
 
     it('Element - should NOT be called in template', () => {
       const element = new ElementClass();
       element.setAttribute('layout', 'fill');
-      element.tryUpgrade_();
+      container.appendChild(element);
       element.build();
       expect(element.isBuilt()).to.equal(true);
-      expect(testElementViewportCallback.callCount).to.equal(0);
+      expect(testElementViewportCallback).to.have.not.been.called;
 
       element.isInTemplate_ = true;
       expect(() => {
@@ -1253,25 +1279,22 @@ describe('CustomElement', () => {
 });
 
 
-describe('CustomElement Service Elements', () => {
-  const StubElementClass = document.registerElement('amp-stub2', {
-    prototype: createAmpElementProto(window, 'amp-stub2', ElementStub),
-  });
-
-  let sandbox;
+describes.realWin('CustomElement Service Elements', {amp: true}, env => {
+  let win, doc;
+  let StubElementClass;
   let element;
 
   beforeEach(() => {
-    sandbox = sinon.sandbox.create();
+    win = env.win;
+    doc = win.document;
+    StubElementClass = doc.registerElement('amp-stub2', {
+      prototype: createAmpElementProto(win, 'amp-stub2', ElementStub),
+    });
     element = new StubElementClass();
   });
 
-  afterEach(() => {
-    sandbox.restore();
-  });
-
   function createWithAttr(attr) {
-    const child = document.createElement('div');
+    const child = doc.createElement('div');
     child.setAttribute(attr, '');
     return child;
   }
@@ -1282,12 +1305,12 @@ describe('CustomElement Service Elements', () => {
   });
 
   it('getRealChildren should return content-only nodes', () => {
-    element.appendChild(document.createElement('i-amp-service'));
+    element.appendChild(doc.createElement('i-amp-service'));
     element.appendChild(createWithAttr('placeholder'));
     element.appendChild(createWithAttr('fallback'));
     element.appendChild(createWithAttr('overflow'));
-    element.appendChild(document.createTextNode('abc'));
-    element.appendChild(document.createElement('content'));
+    element.appendChild(doc.createTextNode('abc'));
+    element.appendChild(doc.createElement('content'));
 
     const nodes = element.getRealChildNodes();
     expect(nodes.length).to.equal(2);
@@ -1299,6 +1322,30 @@ describe('CustomElement Service Elements', () => {
     expect(elements[0].tagName.toLowerCase()).to.equal('content');
   });
 
+  it('toggleLayoutDisplay should add/remove display class', () => {
+    element.setAttribute('layout', 'nodisplay');
+    win.document.body.appendChild(element);
+    return poll('wait for static layout',
+            () => element.classList.contains('i-amphtml-layout-nodisplay'))
+        .then(() => {
+          // TODO(dvoytenko, #9353): once `toggleLayoutDisplay` API has been
+          // deployed this will start `false`.
+          expect(element.classList.contains('i-amphtml-display')).to.be.true;
+
+          element.style.display = 'block';
+          element.toggleLayoutDisplay(true);
+          expect(element.classList.contains('i-amphtml-display')).to.be.true;
+          expect(win.getComputedStyle(element).display).to.equal('block');
+
+          element.toggleLayoutDisplay(false);
+          expect(element.classList.contains('i-amphtml-display')).to.be.false;
+          expect(win.getComputedStyle(element).display).to.equal('none');
+
+          element.toggleLayoutDisplay(true);
+          expect(element.classList.contains('i-amphtml-display')).to.be.true;
+          expect(win.getComputedStyle(element).display).to.equal('block');
+        });
+  });
 
   it('getPlaceholder should return nothing', () => {
     expect(element.getPlaceholder()).to.be.null;
@@ -1312,7 +1359,7 @@ describe('CustomElement Service Elements', () => {
 
   it('getPlaceholder should blacklist some tags', () => {
     const placeholder1 = element.appendChild(createWithAttr('placeholder'));
-    const input = document.createElement('input');
+    const input = doc.createElement('input');
     input.setAttribute('placeholder', '');
     element.appendChild(input);
     expect(element.getPlaceholder()).to.not.equal(input);
@@ -1337,21 +1384,49 @@ describe('CustomElement Service Elements', () => {
   });
 
   it('toggleFallback should toggle unsupported class', () => {
-    const fallback = element.appendChild(createWithAttr('fallback'));
-    const resourcesSpy = sandbox.spy();
+    element.resource = {
+      getState: () => {return ResourceState.LAYOUT_COMPLETE;},
+    };
     element.resources_ = {
       scheduleLayout: function(el, fb) {
         if (el == element && fb == fallback) {
           resourcesSpy();
         }
       },
+      getResourceForElement: element => {
+        return element.resource;
+      },
     };
+    const fallback = element.appendChild(createWithAttr('fallback'));
+    const resourcesSpy = sandbox.spy();
     element.toggleFallback(true);
     expect(element).to.have.class('amp-notsupported');
-    expect(resourcesSpy.callCount).to.equal(1);
+    expect(resourcesSpy).to.be.calledOnce;
 
     element.toggleFallback(false);
     expect(element).to.not.have.class('amp-notsupported');
+  });
+
+  it('toggleFallback should not display fallback before element layout', () => {
+    let resourceState = ResourceState.NOT_LAID_OUT;
+    element.resource = {
+      getState: () => {return resourceState;},
+    };
+    element.resources_ = {
+      scheduleLayout: () => {},
+      getResourceForElement: element => {
+        return element.resource;
+      },
+    };
+    element.appendChild(createWithAttr('fallback'));
+    element.toggleFallback(true);
+    expect(element).to.not.have.class('amp-notsupported');
+    resourceState = ResourceState.READY_FOR_LAYOUT;
+    element.toggleFallback(true);
+    expect(element).to.not.have.class('amp-notsupported');
+    resourceState = ResourceState.LAYOUT_COMPLETE;
+    element.toggleFallback(true);
+    expect(element).to.have.class('amp-notsupported');
   });
 
   it('togglePlaceholder should NOT call in template', () => {
@@ -1363,47 +1438,50 @@ describe('CustomElement Service Elements', () => {
 });
 
 
-describe('CustomElement Loading Indicator', () => {
+describes.realWin('CustomElement Loading Indicator', {amp: true}, env => {
+  let win, doc;
+  let ElementClass;
+  let clock;
+  let resources;
+  let element;
+  let vsync;
+  let vsyncTasks;
+  let resourcesMock;
+  let container;
 
   class TestElement extends BaseElement {
     isLayoutSupported(unusedLayout) {
       return true;
     }
   }
-  const ElementClass = document.registerElement('amp-test-loader', {
-    prototype: createAmpElementProto(window, 'amp-test-loader', TestElement),
-  });
-
-  const resources = installResourcesServiceForDoc(window.document);
-  let sandbox;
-  let clock;
-  let element;
-  let savedMutate;
-  let vsync;
-  let vsyncTasks;
-  let resourcesMock;
 
   beforeEach(() => {
+    win = env.win;
+    doc = win.document;
+    clock = lolex.install(win);
+    ElementClass = doc.registerElement('amp-test-loader', {
+      prototype: createAmpElementProto(win, 'amp-test-loader', TestElement),
+    });
     LOADING_ELEMENTS_['amp-test-loader'.toUpperCase()] = true;
-    sandbox = sinon.sandbox.create();
-    clock = sandbox.useFakeTimers();
+    resources = resourcesForDoc(doc);
+    resources.isBuildOn_ = true;
     resourcesMock = sandbox.mock(resources);
     element = new ElementClass();
     element.layoutWidth_ = 300;
     element.layout_ = Layout.FIXED;
+    element.setAttribute('layout', 'fixed');
     element.resources_ = resources;
-    vsync = vsyncFor(window);
-    savedMutate = vsync.mutate;
+    vsync = vsyncFor(win);
     vsyncTasks = [];
-    vsync.mutate = mutator => {
+    sandbox.stub(vsync, 'mutate', mutator => {
       vsyncTasks.push(mutator);
-    };
+    });
+    container = doc.createElement('div');
+    doc.body.appendChild(container);
   });
 
   afterEach(() => {
-    vsync.mutate = savedMutate;
     resourcesMock.verify();
-    sandbox.restore();
   });
 
 
@@ -1457,6 +1535,28 @@ describe('CustomElement Loading Indicator', () => {
     element.setAttribute('noloading', '');
     element.toggleLoading_(true);
     expect(vsyncTasks).to.be.empty;
+  });
+
+  it('should ignore loading-on if already rendered', () => {
+    clock.tick(1);
+    element.signals().signal('render-start');
+    element.toggleLoading_(true);
+    expect(vsyncTasks).to.be.empty;
+  });
+
+  it('should ignore loading-on if already loaded', () => {
+    element.layoutCount_ = 1;
+    element.toggleLoading_(true);
+    expect(vsyncTasks).to.be.empty;
+  });
+
+  it('should cancel loading on render-start', () => {
+    clock.tick(1);
+    const stub = sandbox.stub(element, 'toggleLoading_');
+    element.renderStarted();
+    expect(element.signals().get('render-start')).to.be.ok;
+    expect(stub).to.be.calledOnce;
+    expect(stub.args[0][0]).to.be.false;
   });
 
   it('should create and turn on', () => {
@@ -1521,7 +1621,7 @@ describe('CustomElement Loading Indicator', () => {
   it('should turn off when exits viewport', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
     element.viewportCallback(false);
-    expect(toggle.callCount).to.equal(1);
+    expect(toggle).to.be.calledOnce;
     expect(toggle.firstCall.args[0]).to.equal(false);
     expect(toggle.firstCall.args[1]).to.be.undefined;
   });
@@ -1530,14 +1630,14 @@ describe('CustomElement Loading Indicator', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
     element.layoutCount_ = 1;
     element.viewportCallback(false);
-    expect(toggle.callCount).to.equal(0);
+    expect(toggle).to.have.not.been.called;
   });
 
   it('should turn on when enters viewport', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
     element.viewportCallback(true);
     clock.tick(1000);
-    expect(toggle.callCount).to.equal(1);
+    expect(toggle).to.be.calledOnce;
     expect(toggle.firstCall.args[0]).to.equal(true);
   });
 
@@ -1546,7 +1646,7 @@ describe('CustomElement Loading Indicator', () => {
     element.layoutCount_ = 1;
     element.viewportCallback(true);
     clock.tick(1000);
-    expect(toggle.callCount).to.equal(0);
+    expect(toggle).to.have.not.been.called;
   });
 
 
@@ -1554,14 +1654,14 @@ describe('CustomElement Loading Indicator', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
     element.isInViewport_ = true;
     element.updateLayoutBox({top: 0, width: 300});
-    expect(toggle.callCount).to.equal(1);
+    expect(toggle).to.be.calledOnce;
     expect(toggle.firstCall.args[0]).to.equal(true);
   });
 
   it('should create loading when measured if in the top window', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
     element.updateLayoutBox({top: 0, width: 300});
-    expect(toggle.callCount).to.equal(0);
+    expect(toggle).to.have.not.been.called;
     expect(vsyncTasks).to.have.length.of(1);
     vsyncTasks.shift()();
     expect(element.loadingContainer_).to.not.be.null;
@@ -1571,10 +1671,9 @@ describe('CustomElement Loading Indicator', () => {
 
   it('should toggle loading off after layout complete', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
-    element.tryUpgrade_();
-    element.build();
+    container.appendChild(element);
     return element.layoutCallback().then(() => {
-      expect(toggle.callCount).to.equal(1);
+      expect(toggle).to.be.calledOnce;
       expect(toggle.firstCall.args[0]).to.equal(false);
       expect(toggle.firstCall.args[1]).to.equal(true);
     }, () => {
@@ -1584,14 +1683,14 @@ describe('CustomElement Loading Indicator', () => {
 
   it('should toggle loading off after layout failed', () => {
     const toggle = sandbox.spy(element, 'toggleLoading_');
-    const implMock = sandbox.mock(element.implementation_);
-    implMock.expects('layoutCallback').returns(Promise.reject());
-    element.tryUpgrade_();
-    element.build();
+    sandbox.stub(element.implementation_, 'layoutCallback', () => {
+      return Promise.reject();
+    });
+    container.appendChild(element);
     return element.layoutCallback().then(() => {
       throw new Error('Should never happen.');
     }, () => {
-      expect(toggle.callCount).to.equal(1);
+      expect(toggle).to.be.calledOnce;
       expect(toggle.firstCall.args[0]).to.equal(false);
       expect(toggle.firstCall.args[1]).to.equal(true);
     });
@@ -1599,10 +1698,10 @@ describe('CustomElement Loading Indicator', () => {
 
   it('should disable toggle loading on after layout failed', () => {
     const prepareLoading = sandbox.spy(element, 'prepareLoading_');
-    const implMock = sandbox.mock(element.implementation_);
-    implMock.expects('layoutCallback').returns(Promise.reject());
-    element.tryUpgrade_();
-    element.build();
+    sandbox.stub(element.implementation_, 'layoutCallback', () => {
+      return Promise.reject();
+    });
+    container.appendChild(element);
     expect(element.layoutCount_).to.equal(0);
     expect(element.isLoadingEnabled_()).to.equal(true);
     return element.layoutCallback().then(() => {
@@ -1617,7 +1716,7 @@ describe('CustomElement Loading Indicator', () => {
 
   it('should ignore loading "on" if layout completed before vsync', () => {
     resourcesMock.expects('deferMutate').once();
-    element.tryUpgrade_();
+    container.appendChild(element);
     element.prepareLoading_();
     element.toggleLoading_(true);
     element.build();
@@ -1640,48 +1739,46 @@ describe('CustomElement Loading Indicator', () => {
 });
 
 
-describe('CustomElement Overflow Element', () => {
+describes.realWin('CustomElement Overflow Element', {amp: true}, env => {
+  let win, doc;
+  let ElementClass;
+  let element;
+  let overflowElement;
+  let vsync;
+  let vsyncTasks;
+  let resources;
+  let resourcesMock;
 
   class TestElement extends BaseElement {
     isLayoutSupported(unusedLayout) {
       return true;
     }
   }
-  const ElementClass = document.registerElement('amp-test-overflow', {
-    prototype: createAmpElementProto(window, 'amp-test-overflow', TestElement),
-  });
-
-  const resources = installResourcesServiceForDoc(window.document);
-  let sandbox;
-  let element;
-  let overflowElement;
-  let savedMutate;
-  let vsync;
-  let vsyncTasks;
-  let resourcesMock;
 
   beforeEach(() => {
-    sandbox = sinon.sandbox.create();
+    win = env.win;
+    doc = win.document;
+    ElementClass = doc.registerElement('amp-test-overflow', {
+      prototype: createAmpElementProto(win, 'amp-test-overflow', TestElement),
+    });
+    resources = resourcesForDoc(doc);
     resourcesMock = sandbox.mock(resources);
     element = new ElementClass();
     element.layoutWidth_ = 300;
     element.layout_ = Layout.FIXED;
     element.resources_ = resources;
-    overflowElement = document.createElement('div');
+    overflowElement = doc.createElement('div');
     overflowElement.setAttribute('overflow', '');
     element.appendChild(overflowElement);
-    vsync = vsyncFor(window);
-    savedMutate = vsync.mutate;
+    vsync = vsyncFor(win);
     vsyncTasks = [];
-    vsync.mutate = mutator => {
+    sandbox.stub(vsync, 'mutate', mutator => {
       vsyncTasks.push(mutator);
-    };
+    });
   });
 
   afterEach(() => {
-    vsync.mutate = savedMutate;
     resourcesMock.verify();
-    sandbox.restore();
   });
 
   it('should NOT be initialized by default', () => {
@@ -1801,13 +1898,13 @@ describe('CustomElement Overflow Element', () => {
       };
       doc.defaultView = win;
 
-      resetServiceForTesting(window, 'e1');
-      resetScheduledElementForTesting(window, 'element-1');
+      resetServiceForTesting(win, 'e1');
+      resetScheduledElementForTesting(win, 'element-1');
     });
 
     afterEach(() => {
-      resetScheduledElementForTesting(window, 'amp-test1');
-      resetScheduledElementForTesting(window, 'amp-test2');
+      resetScheduledElementForTesting(win, 'amp-test1');
+      resetScheduledElementForTesting(win, 'amp-test2');
     });
 
     it('should be stub elements when body available', () => {
@@ -1816,7 +1913,7 @@ describe('CustomElement Overflow Element', () => {
       expect(win.ampExtendedElements).to.exist;
       expect(win.ampExtendedElements['amp-test1']).to.equal(ElementStub);
       expect(win.ampExtendedElements['amp-test2']).to.be.undefined;
-      expect(doc.registerElement.callCount).to.equal(1);
+      expect(doc.registerElement).to.be.calledOnce;
       expect(doc.registerElement.firstCall.args[0]).to.equal('amp-test1');
       expect(intervalCallback).to.be.undefined;
     });
@@ -1829,7 +1926,7 @@ describe('CustomElement Overflow Element', () => {
       expect(win.ampExtendedElements).to.exist;
       expect(win.ampExtendedElements['amp-test1']).to.equal(ElementStub);
       expect(win.ampExtendedElements['amp-test2']).to.be.undefined;
-      expect(doc.registerElement.callCount).to.equal(1);
+      expect(doc.registerElement).to.be.calledOnce;
       expect(doc.registerElement.firstCall.args[0]).to.equal('amp-test1');
       expect(intervalCallback).to.exist;
 
@@ -1848,7 +1945,7 @@ describe('CustomElement Overflow Element', () => {
 
       expect(win.ampExtendedElements['amp-test1']).to.equal(ElementStub);
       expect(win.ampExtendedElements['amp-test2']).to.equal(ElementStub);
-      expect(doc.registerElement.callCount).to.equal(2);
+      expect(doc.registerElement).to.have.callCount(2);
       expect(doc.registerElement.getCall(1).args[0]).to.equal('amp-test2');
     });
 
@@ -1858,12 +1955,12 @@ describe('CustomElement Overflow Element', () => {
 
       expect(win.ampExtendedElements).to.exist;
       expect(win.ampExtendedElements['amp-test1']).to.equal(ElementStub);
-      expect(doc.registerElement.callCount).to.equal(1);
+      expect(doc.registerElement).to.be.calledOnce;
       expect(doc.registerElement.firstCall.args[0]).to.equal('amp-test1');
 
       // Second stub is ignored.
       stubElementIfNotKnown(win, 'amp-test1');
-      expect(doc.registerElement.callCount).to.equal(1);
+      expect(doc.registerElement).to.be.calledOnce;
     });
 
     it('should copy or stub element definitions in a child window', () => {
@@ -1933,15 +2030,15 @@ describe('CustomElement Overflow Element', () => {
 
         // Resolve body.
         markElementScheduledForTesting(win, 'element-1');
-        getService(win, 'e1', function() {
-          return 'fake1';
+        registerServiceBuilder(win, 'e1', function() {
+          return {str: 'fake1'};
         });
         doc.body = {};
         intervalCallback();
         return p1;
       }).then(service => {
-        expect(resolvedService).to.equal('fake1');
-        expect(service).to.equal('fake1');
+        expect(resolvedService).to.deep.equal({str: 'fake1'});
+        expect(service).to.deep.equal({str: 'fake1'});
       });
     });
 
@@ -1951,18 +2048,17 @@ describe('CustomElement Overflow Element', () => {
       const p1 = getElementServiceIfAvailable(win, 'e1', 'element-1');
       return Promise.resolve().then(() => {
         expect(intervalCallback).to.be.undefined;
-
-        // Resolve service.
-        getService(win, 'e1', function() {
-          return 'fake1';
+        registerServiceBuilder(win, 'e1', function() {
+          return {str: 'fake1'};
         });
         return p1;
       }).then(service => {
-        expect(service).to.equal('fake1');
+        expect(service).to.deep.equal({str: 'fake1'});
       });
     });
   });
 });
+
 
 describes.realWin('services', {
   amp: {
@@ -1981,12 +2077,12 @@ describes.realWin('services', {
     const p1 = getElementService(env.win, 'e1', 'element-1');
     const p2 = getElementService(env.win, 'e1', 'element-1');
 
-    getService(env.win, 'e1', function() {
-      return 'from e1';
+    registerServiceBuilder(env.win, 'e1', function() {
+      return {str: 'from e1'};
     });
 
     return p1.then(s1 => {
-      expect(s1).to.equal('from e1');
+      expect(s1).to.deep.equal({str: 'from e1'});
       return p2.then(s2 => {
         expect(s1).to.equal(s2);
       });
@@ -2010,11 +2106,11 @@ describes.realWin('services', {
     markElementScheduledForTesting(env.win, 'element-1');
     const p1 = getElementServiceIfAvailable(env.win, 'e1', 'element-1');
     const p2 = getElementServiceIfAvailable(env.win, 'e2', 'not-available');
-    getService(env.win, 'e1', function() {
-      return 'from e1';
+    registerServiceBuilder(env.win, 'e1', function() {
+      return {str: 'from e1'};
     });
     return p1.then(s1 => {
-      expect(s1).to.equal('from e1');
+      expect(s1).to.deep.equal({str: 'from e1'});
       return p2.then(s2 => {
         expect(s2).to.be.null;
       });
@@ -2026,12 +2122,12 @@ describes.realWin('services', {
     const p1 = getElementServiceForDoc(env.ampdoc, 'e1', 'element-1');
     const p2 = getElementServiceForDoc(env.ampdoc, 'e1', 'element-1');
 
-    getService(env.win, 'e1', function() {
-      return 'from e1';
+    registerServiceBuilder(env.win, 'e1', function() {
+      return {str: 'from e1'};
     });
 
     return p1.then(s1 => {
-      expect(s1).to.equal('from e1');
+      expect(s1).to.deep.equal({str: 'from e1'});
       return p2.then(s2 => {
         expect(s1).to.equal(s2);
       });
@@ -2057,11 +2153,11 @@ describes.realWin('services', {
         env.ampdoc, 'e1', 'element-1');
     const p2 = getElementServiceIfAvailableForDoc(
         env.ampdoc, 'e2', 'not-available');
-    getService(env.win, 'e1', function() {
-      return 'from e1';
+    registerServiceBuilder(env.win, 'e1', function() {
+      return {str: 'from e1'};
     });
     return p1.then(s1 => {
-      expect(s1).to.equal('from e1');
+      expect(s1).to.deep.equal({str: 'from e1'});
       return p2.then(s2 => {
         expect(s2).to.be.null;
       });
@@ -2117,14 +2213,14 @@ describes.realWin('services', {
 
       // Resolve body.
       markElementScheduledForTesting(env.win, 'element-1');
-      getService(env.win, 'e1', function() {
-        return 'fake1';
+      registerServiceBuilder(env.win, 'e1', function() {
+        return {str: 'fake1'};
       });
       bodyResolver();
       return p1;
     }).then(service => {
-      expect(resolvedService).to.equal('fake1');
-      expect(service).to.equal('fake1');
+      expect(resolvedService).to.deep.equal({str: 'fake1'});
+      expect(service).to.deep.equal({str: 'fake1'});
     });
   });
 
@@ -2133,13 +2229,12 @@ describes.realWin('services', {
     const p1 = getElementServiceIfAvailableForDoc(
         env.ampdoc, 'e1', 'element-1');
     return Promise.resolve().then(() => {
-      // Resolve service.
-      getService(env.win, 'e1', function() {
-        return 'fake1';
+      registerServiceBuilder(env.win, 'e1', function() {
+        return {str: 'fake1'};
       });
       return p1;
     }).then(service => {
-      expect(service).to.equal('fake1');
+      expect(service).to.deep.equal({str: 'fake1'});
     });
   });
 });

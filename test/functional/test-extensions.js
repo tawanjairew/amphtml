@@ -26,6 +26,8 @@ import {
   installExtensionsService,
   registerExtension,
 } from '../../src/service/extensions-impl';
+import {extensionsFor} from '../../src/services';
+import {registerServiceBuilder} from '../../src/service';
 import {resetScheduledElementForTesting} from '../../src/custom-element';
 import {loadPromise} from '../../src/event-helper';
 
@@ -200,10 +202,10 @@ describes.sandboxed('Extensions', {}, () => {
       const promise = installExtensionsInShadowDoc(
           extensions, ampdoc, ['amp-ext']);
       return promise.then(() => {
-        expect(factory1.callCount).to.equal(1);
+        expect(factory1).to.be.calledOnce;
         expect(factory1.args[0][0]).to.equal(ampdoc);
         // Should survive errors in one factory.
-        expect(factory3.callCount).to.equal(1);
+        expect(factory3).to.be.calledOnce;
         expect(factory3.args[0][0]).to.equal(ampdoc);
       });
     });
@@ -248,10 +250,10 @@ describes.sandboxed('Extensions', {}, () => {
       const promise = installExtensionsInShadowDoc(
           extensions, ampdoc, ['amp-ext']);
       return promise.then(() => {
-        expect(factory1.callCount).to.equal(1);
+        expect(factory1).to.be.calledOnce;
         expect(factory1.args[0][0]).to.equal(shadowRoot);
         // Should survive errors in one factory.
-        expect(factory3.callCount).to.equal(1);
+        expect(factory3).to.be.calledOnce;
         expect(factory3.args[0][0]).to.equal(shadowRoot);
       });
     });
@@ -273,10 +275,10 @@ describes.sandboxed('Extensions', {}, () => {
       const promise = extensions.installFactoriesInShadowRoot(
           shadowRoot, ['amp-ext']);
       return promise.then(() => {
-        expect(factory1.callCount).to.equal(1);
+        expect(factory1).to.be.calledOnce;
         expect(factory1.args[0][0]).to.equal(shadowRoot);
         // Should survive errors in one factory.
-        expect(factory3.callCount).to.equal(1);
+        expect(factory3).to.be.calledOnce;
         expect(factory3.args[0][0]).to.equal(shadowRoot);
       });
     });
@@ -391,7 +393,8 @@ describes.sandboxed('Extensions', {}, () => {
     beforeEach(() => {
       parentWin = env.win;
       resetScheduledElementForTesting(parentWin, 'amp-test');
-      extensions = installExtensionsService(parentWin);
+      installExtensionsService(parentWin);
+      extensions = extensionsFor(parentWin);
       extensionsMock = sandbox.mock(extensions);
 
       iframe = parentWin.document.createElement('iframe');
@@ -471,7 +474,10 @@ describes.sandboxed('Extensions', {}, () => {
           }, parentWin.AMP);
           const elements = {};
           elements[extensionId] = {css: 'a{}'};
-          return {elements};
+          return {
+            elements,
+            services: [],
+          };
         });
       });
       const promise = extensions.installExtensionsInChildWindow(
@@ -492,6 +498,39 @@ describes.sandboxed('Extensions', {}, () => {
       });
     });
 
+    it('should adopt extension services', () => {
+      const fooSpy = sandbox.spy();
+      const fakeServiceFoo = {adoptEmbedWindow: fooSpy};
+      registerServiceBuilder(parentWin, 'fake-service-foo',
+          () => fakeServiceFoo, /* opt_instantiate */ true);
+
+      const barSpy = sandbox.spy();
+      const fakeServiceBar = {adoptEmbedWindow: barSpy};
+      registerServiceBuilder(parentWin, 'fake-service-bar',
+          () => fakeServiceBar, /* opt_instantiate */ true);
+
+      sandbox.stub(extensions, 'loadExtension', extensionId => {
+        return Promise.resolve().then(() => {
+          registerExtension(extensions, extensionId, AMP => {
+            AMP.registerElement(extensionId, AmpTest);
+          }, parentWin.AMP);
+          const elements = {};
+          elements[extensionId] = {};
+          return /* ExtensionDef */ {
+            elements,
+            services: ['fake-service-foo'], // fake-service-bar NOT included.
+          };
+        });
+      });
+
+      const promise =
+          extensions.installExtensionsInChildWindow(iframeWin, ['amp-test']);
+      return promise.then(() => {
+        expect(fooSpy).calledOnce;
+        expect(barSpy).notCalled;
+      });
+    });
+
     it('should call pre-install callback before other installs', () => {
       const stub = sandbox.stub(extensions, 'loadExtension', extensionId => {
         registerExtension(extensions, extensionId, AMP => {
@@ -499,7 +538,10 @@ describes.sandboxed('Extensions', {}, () => {
         }, parentWin.AMP);
         const elements = {};
         elements[extensionId] = {css: 'a{}'};
-        return Promise.resolve({elements});
+        return Promise.resolve({
+          elements,
+          services: [],
+        });
       });
       let preinstallCount = 0;
       const promise = extensions.installExtensionsInChildWindow(
